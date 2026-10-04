@@ -200,10 +200,10 @@ def test_latency_uses_recv_time_plus_delay_and_refuses_gap_and_ended() -> None:
 
     replay.rest(6, "t", None, "periodic", None, None, "HTTP 404", recv_wall="2026-10-03T14:00:04+00:00")
     replay.rest(7, "t", None, "periodic", None, None, "HTTP 404", recv_wall="2026-10-03T14:00:05+00:00")
-    ended = fill("2026-10-03T14:00:05+00:00", 0)
-    assert ended.reason == "ended"
     still_live = fill("2026-10-03T14:00:04.500000+00:00", 0)
     assert still_live.reason != "ended"
+    ended = fill("2026-10-03T14:00:05+00:00", 0)
+    assert ended.reason == "ended"
 
 
 def test_unanchored_before_any_book() -> None:

@@ -12,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pmbot.data.bookbuild import DUPLICATE_MAP_CAP, DUPLICATE_WINDOW_NS, BookReplay, is_duplicate_ws  # noqa: E402
+from pmbot.data.bookbuild import DUPLICATE_MAP_CAP, DUPLICATE_WINDOW_NS, BookReplay, RecvClock, is_duplicate_ws  # noqa: E402
 from pmbot.data.jsonl_log import iter_jsonl_gz  # noqa: E402
 from pmbot.data.scope import event_asset_ids  # noqa: E402
 
@@ -45,7 +45,12 @@ def _load_gamma(path: Path, replay: BookReplay) -> None:
     for token, info in meta.items():
         if not isinstance(info, dict):
             continue
-        replay.set_gamma(str(token), str(info.get("gamma_status") or "unknown"), str(info.get("question") or ""))
+        replay.set_gamma(
+            str(token),
+            str(info.get("gamma_status") or "unknown"),
+            str(info.get("question") or ""),
+            str(info.get("slug") or ""),
+        )
 
 
 def replay_dir(books: Path, replay: BookReplay) -> dict:
@@ -64,6 +69,7 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
     ignored_bootstrap = 0
     multi_entry_tokens = 0
     bootstrapped: set[str] = set()
+    clock = RecvClock()
     files = sorted(books.rglob("*.jsonl.gz"))
     for path in files:
         for record in iter_jsonl_gz(path):
@@ -71,9 +77,22 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
             kind = record.get("kind")
             wall = record.get("recv_wall")
             wall_s = wall if isinstance(wall, str) else None
+            connection = record.get("connection_id")
+            connection_id = connection if isinstance(connection, str) else None
+            mono_raw = record.get("recv_monotonic_ns")
+            mono = int(mono_raw) if isinstance(mono_raw, int) else None
             if kind == "session_start":
+                if connection_id:
+                    clock.session_start(connection_id)
+                clock.observe(connection_id, wall_s, mono)
                 replay.note_session_start(wall_s or "", bool(record.get("is_reconnect")))
                 continue
+            if kind == "session_stop":
+                clock.observe(connection_id, wall_s, mono)
+                if connection_id:
+                    clock.session_stop(connection_id)
+                continue
+            clock.observe(connection_id, wall_s, mono)
             if kind == "ws":
                 raw = record.get("raw")
                 if not isinstance(raw, str):
@@ -184,6 +203,8 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
     }
     report["ignored_extra_bootstrap"] = ignored_bootstrap
     report["price_change_multi_entry_tokens"] = multi_entry_tokens
+    report["recv_clock"] = clock.as_dict()
+    report["token_recv_wall_backward"] = replay.token_wall_backward
     return report
 
 

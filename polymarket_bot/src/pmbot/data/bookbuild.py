@@ -18,8 +18,8 @@ current best price is deleted.
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from collections import defaultdict, deque
-from datetime import datetime, timezone
+from collections import Counter, defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 # book/anchor: (kind, index, ts, bids, asks, recv_wall)
@@ -67,6 +67,237 @@ def iso_to_ns(value: str) -> int:
         moment = moment.replace(tzinfo=timezone.utc)
     delta = moment.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
     return delta.days * 86_400 * 1_000_000_000 + delta.seconds * 1_000_000_000 + delta.microseconds * 1000
+
+
+def ns_to_iso(ns: int) -> str:
+    """Inverse of `iso_to_ns` at microsecond resolution."""
+    seconds, rem = divmod(int(ns), 1_000_000_000)
+    moment = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=seconds, microseconds=rem // 1000)
+    return moment.isoformat()
+
+
+# Slug prefixes of markets that were live matches on the soak day, not long-dated sports.
+ESPORTS_SLUGS = ("cs2-", "dota2-", "lol-", "val-")
+SPORTS_SLUGS = ("fif-", "unl-", "es2-", "wta-")
+
+
+def market_bucket(slug: str) -> str:
+    """esports_in_play, sports_in_play, or other. Long-dated sports slugs are other."""
+    text = (slug or "").lower()
+    if text.startswith(ESPORTS_SLUGS):
+        return "esports_in_play"
+    if text.startswith(SPORTS_SLUGS):
+        return "sports_in_play"
+    return "other"
+
+
+class RecvClock:
+    """Monotonicity of recv clocks inside one session.
+
+    A session starts at session_start for that connection_id and ends at the
+    next session_start for the same id (or session_stop). Comparisons do not
+    cross that boundary. ISO-8601 recv_wall strings in this tape sort in time
+    order. recv_monotonic_ns is only compared inside the same session because
+    two processes do not share a monotonic epoch.
+    """
+
+    def __init__(self) -> None:
+        self.wall: dict[str, str] = {}
+        self.mono: dict[str, int] = {}
+        self.wall_backward = 0
+        self.mono_backward = 0
+        self.wall_backward_min: str | None = None
+        self.wall_backward_max: str | None = None
+        self.sessions = 0
+        self.examples: list[dict] = []
+
+    def session_start(self, connection_id: str) -> None:
+        self.sessions += 1
+        self.wall.pop(connection_id, None)
+        self.mono.pop(connection_id, None)
+
+    def session_stop(self, connection_id: str) -> None:
+        self.wall.pop(connection_id, None)
+        self.mono.pop(connection_id, None)
+
+    def observe(self, connection_id: str | None, wall: str | None, mono: int | None) -> None:
+        if not connection_id:
+            return
+        if wall:
+            previous = self.wall.get(connection_id)
+            if previous is not None and wall < previous:
+                self.wall_backward += 1
+                if self.wall_backward_min is None or wall < self.wall_backward_min:
+                    self.wall_backward_min = wall
+                if self.wall_backward_max is None or wall > self.wall_backward_max:
+                    self.wall_backward_max = wall
+                if len(self.examples) < 5:
+                    self.examples.append({"clock": "recv_wall", "connection_id": connection_id, "prev": previous, "value": wall})
+            self.wall[connection_id] = wall
+        if mono is not None:
+            previous_mono = self.mono.get(connection_id)
+            if previous_mono is not None and mono < previous_mono:
+                self.mono_backward += 1
+                if len(self.examples) < 5:
+                    self.examples.append(
+                        {"clock": "recv_monotonic_ns", "connection_id": connection_id, "prev": previous_mono, "value": mono}
+                    )
+            self.mono[connection_id] = mono
+
+    def as_dict(self) -> dict:
+        return {
+            "sessions": self.sessions,
+            "recv_wall_backward": self.wall_backward,
+            "recv_wall_backward_min": self.wall_backward_min,
+            "recv_wall_backward_max": self.wall_backward_max,
+            "recv_monotonic_ns_backward": self.mono_backward,
+            "examples": self.examples,
+        }
+
+
+class BookCursor:
+    """Forward-only book. advance() applies each mutation once and never rescans.
+
+    The clock is recv_wall. Queries for one token must be non-decreasing.
+    A recv_wall that steps backward in tape order is clamped to the previous
+    stamp and applied once. recv_monotonic_ns is not a substitute: two
+    processes do not share that epoch, and on this tape it steps backward
+    on the same records. The cursor does not rescan.
+
+    same-ms: when another WS event for this token shares the server timestamp
+    (either tape order; counted after note_ws), view(defer=True) is the book
+    from before that timestamp and view() is tape order. Those two readings
+    are the range. Once the query is strictly later than the last mutation of
+    that timestamp, defer collapses to tape. Events later than the query are
+    not used. A reorder of repeated writes to one price is not a third book.
+    """
+
+    def __init__(self, replay: BookReplay, token: str) -> None:
+        self.replay = replay
+        self.token = token
+        self.i = 0
+        self.stamps: list[int] = []
+        self.bids = Side(high=True)
+        self.asks = Side(high=False)
+        self.anchored = False
+        self.gap_frozen = False
+        self.asof_ns: int | None = None
+        self.in_tie = False
+        self.tie_ts: int | None = None
+        self.tie_applied = 0
+        self.clamped = 0
+        self._group_last: dict[int, int] = {}
+        self._group_n = -1
+        self.before_bids = self.bids
+        self.before_asks = self.asks
+        self.before_anchored = False
+        self.before_gap = False
+
+    def advance(self, asof_ns: int) -> None:
+        if self.asof_ns is not None and asof_ns < self.asof_ns:
+            raise ValueError(f"forward-only cursor for {self.token}: query went backward")
+        self.asof_ns = asof_ns
+        muts = self.replay.muts[self.token]
+        while len(self.stamps) < len(muts):
+            wall = muts[len(self.stamps)][-1]
+            if not isinstance(wall, str):
+                raise ValueError(f"token {self.token} event has no recv_wall")
+            stamp = iso_to_ns(wall)
+            if self.stamps and stamp < self.stamps[-1]:
+                # File order is not wall order (two writers, one connection id).
+                # Keep the high-water stamp and still apply this event once,
+                # in tape order. Do not rescan and do not switch clocks.
+                stamp = self.stamps[-1]
+                self.clamped += 1
+            self.stamps.append(stamp)
+        while self.i < len(muts) and self.stamps[self.i] <= asof_ns:
+            self._apply(muts[self.i])
+            self.i += 1
+        # At the recv time of the last event in a same-ms group the two
+        # readings still differ (tape vs the book from before the group).
+        # Once the query is strictly later and every book mutation of that
+        # server timestamp is already applied, dropping the group is not the
+        # other ordering. Defer collapses to tape. best_bid_ask rows do not
+        # mutate the book, so they do not extend the group. A reorder of
+        # repeated writes to one price inside the group is not a separate book.
+        if self.in_tie and self.tie_ts is not None and self.i > 0 and asof_ns > self.stamps[self.i - 1]:
+            last = self._groups().get(self.tie_ts, -1)
+            if last < self.i:
+                self.in_tie = False
+
+    def _groups(self) -> dict[int, int]:
+        muts = self.replay.muts[self.token]
+        if self._group_n != len(muts):
+            last: dict[int, int] = {}
+            for index, mut in enumerate(muts):
+                if mut[0] == "gap":
+                    continue
+                ts = mut[2]
+                if isinstance(ts, int):
+                    last[ts] = index
+            self._group_last = last
+            self._group_n = len(muts)
+        return self._group_last
+
+    def _apply(self, mut: Mut) -> None:
+        kind = mut[0]
+        if kind == "gap":
+            self.bids = Side(high=True)
+            self.asks = Side(high=False)
+            self.anchored = False
+            self.gap_frozen = True
+            self.in_tie = False
+            self.tie_ts = None
+            self.tie_applied = 0
+            return
+        ts = mut[2]
+        tie = isinstance(ts, int) and self.replay.ws_count[self.token][ts] >= 2
+        if tie and ts != self.tie_ts:
+            self.before_bids = self.bids.copy()
+            self.before_asks = self.asks.copy()
+            self.before_anchored = self.anchored
+            self.before_gap = self.gap_frozen
+            self.tie_ts = ts
+            self.in_tie = True
+            self.tie_applied = 0
+        elif not tie:
+            self.in_tie = False
+            self.tie_ts = None
+            self.tie_applied = 0
+        if tie:
+            self.tie_applied += 1
+        if kind == "px":
+            if not self.anchored:
+                return
+            side, price, size = mut[3], mut[4], mut[5]
+            if side == "BUY":
+                self.bids.apply(price, size)
+            elif side == "SELL":
+                self.asks.apply(price, size)
+            return
+        self.bids = _load(mut[3], high=True)
+        self.asks = _load(mut[4], high=False)
+        self.anchored = True
+        self.gap_frozen = False
+
+    def view(self, *, defer: bool = False) -> dict:
+        ended_wall = self.replay.ended_recv_wall.get(self.token)
+        ended_ns = iso_to_ns(ended_wall) if ended_wall else None
+        ended = ended_ns is not None and self.asof_ns is not None and ended_ns <= self.asof_ns
+        if defer and self.in_tie:
+            bids, asks = self.before_bids, self.before_asks
+            anchored, gap = self.before_anchored, self.before_gap
+        else:
+            bids, asks = self.bids, self.asks
+            anchored, gap = self.anchored, self.gap_frozen
+        return {
+            "bids": bids,
+            "asks": asks,
+            "anchored": anchored,
+            "gap_frozen": gap,
+            "ended": ended,
+            "same_ms_tie": bool(self.in_tie),
+        }
 
 
 class Side:
@@ -335,12 +566,22 @@ def _histogram(values: list[float], edges: tuple[tuple[float, float, str], ...])
 
 
 class BookReplay:
-    def __init__(self, *, end_after: int = 3, quiet_ms: int = 1000, mismatch_limit: int = 20) -> None:
+    def __init__(
+        self,
+        *,
+        end_after: int = 3,
+        quiet_ms: int = 1000,
+        mismatch_limit: int = 20,
+        keep_quote_rows: bool = True,
+        score_levels: bool = True,
+    ) -> None:
         if end_after < 1:
             raise ValueError("end_after must be >= 1")
         self.end_after = end_after
         self.quiet_ms = quiet_ms
         self.mismatch_limit = mismatch_limit
+        self.keep_quote_rows = keep_quote_rows
+        self.score_levels = score_levels
         self.muts: dict[str, list[Mut]] = defaultdict(list)
         self.live_bids: dict[str, Side] = {}
         self.live_asks: dict[str, Side] = {}
@@ -353,12 +594,18 @@ class BookReplay:
         self.resolved_server_ts: dict[str, int] = {}
         self.session_start_wall: str | None = None
         self.ws_ts: dict[str, list[int]] = defaultdict(list)
+        self.ws_count: dict[str, Counter] = defaultdict(Counter)
         self.precede: dict[str, deque] = defaultdict(lambda: deque(maxlen=8))
         self.snapshots: list[dict] = []
         self.quote_rows: list[tuple] = []
         self.resolved_quote_walls: list[tuple[str, str]] = []
+        self.quote_mismatches: list[tuple[str, int | None, str]] = []
         self.gamma: dict[str, str] = {}
         self.questions: dict[str, str] = {}
+        self.market_class: dict[str, str] = {}
+        self.last_token_wall: dict[str, str] = {}
+        self.token_wall_backward = 0
+        self._cursors: dict[str, BookCursor] = {}
         self.crossed = 0
         self.crossed_tokens: set[str] = set()
         self.crossed_at_snapshot = {"aligned": 0, "unaligned": 0}
@@ -377,15 +624,26 @@ class BookReplay:
         self.skipped_unanchored_px = 0
         self.quote_checked_unanchored = 0
 
-    def set_gamma(self, token: str, status: str, question: str = "") -> None:
+    def set_gamma(self, token: str, status: str, question: str = "", slug: str = "") -> None:
         self.gamma[token] = status
         if question:
             self.questions[token] = question
+        if slug:
+            self.market_class[token] = market_bucket(slug)
 
     def note_ws(self, token: str, ts: int | None) -> None:
         if ts is None or not token:
             return
         self.ws_ts[token].append(ts)
+        self.ws_count[token][ts] += 1
+
+    def _note_token_wall(self, token: str, wall: str | None) -> None:
+        if not wall:
+            return
+        previous = self.last_token_wall.get(token)
+        if previous is not None and wall < previous:
+            self.token_wall_backward += 1
+        self.last_token_wall[token] = wall
 
     def note_session_start(self, recv_wall: str, is_reconnect: bool) -> None:
         if self.session_start_wall is None and recv_wall:
@@ -409,6 +667,7 @@ class BookReplay:
 
     def gap(self, index: int, token_ids: list[str], recv_wall: str | None = None) -> None:
         for token in token_ids:
+            self._note_token_wall(token, recv_wall)
             self.muts[token].append(("gap", index, recv_wall))
             bids, asks = self._sides(token)
             bids.clear()
@@ -430,6 +689,7 @@ class BookReplay:
     ) -> None:
         bid_levels = levels_of(bids)
         ask_levels = levels_of(asks)
+        self._note_token_wall(token, recv_wall)
         self.muts[token].append((kind, index, ts, bid_levels, ask_levels, recv_wall))
         live_bids = _load(bid_levels, high=True)
         live_asks = _load(ask_levels, high=False)
@@ -463,6 +723,7 @@ class BookReplay:
         recv_wall: str | None = None,
     ) -> None:
         self.note_ws(token, ts)
+        self._note_token_wall(token, recv_wall)
         self.muts[token].append(("px", index, ts, side, str(price), str(size), recv_wall))
         if token not in self.anchored:
             self.skipped_unanchored_px += 1
@@ -520,6 +781,8 @@ class BookReplay:
             return
         if reason != "periodic":
             return
+        if not self.score_levels:
+            return
         book_status = self._book_status(token, index)
         gamma_status = self.gamma.get(token, "unknown")
         anchored_now = token in self.anchored
@@ -559,53 +822,54 @@ class BookReplay:
         for token, stamps in self.ws_ts.items():
             stamps.sort()
         miss_diff = {"extra": 0, "missing": 0, "size_diff": 0}
-        for snap in self.snapshots:
-            token = snap["token"]
-            anchored, bids, asks, last_ts, within_5ms = self._replay(
-                token, aligned=True, cutoff_index=snap["index"], cutoff_ts=snap["ts"]
-            )
-            if not anchored or snap["ts"] is None:
-                continue
-            diff_b = levels_diff(bids, snap["bids"])
-            diff_a = levels_diff(asks, snap["asks"])
-            exact = diff_b["exact"] == 1 and diff_a["exact"] == 1
-            quiet = self._quiet(token, snap["ts"])
-            self.level_aligned.add(token, snap["book_status"], snap["gamma_status"], not exact)
-            top = quote_verdict(bids, asks, *_rest_top(snap["bids"], snap["asks"]))
-            self.top_aligned.add(token, snap["book_status"], snap["gamma_status"], top["verdict"] == "mismatch")
-            if top["crossed"]:
-                self.crossed_at_snapshot["aligned"] += 1
-            if quiet:
-                self.level_aligned_quiet.add(token, snap["book_status"], snap["gamma_status"], not exact)
-                self.top_aligned_quiet.add(
-                    token, snap["book_status"], snap["gamma_status"], top["verdict"] == "mismatch"
+        if self.score_levels:
+            for snap in self.snapshots:
+                token = snap["token"]
+                anchored, bids, asks, last_ts, within_5ms = self._replay(
+                    token, aligned=True, cutoff_index=snap["index"], cutoff_ts=snap["ts"]
                 )
-            if quiet and snap["unaligned_exact"] is not None:
-                self.level_unaligned_quiet.add(
-                    token, snap["book_status"], snap["gamma_status"], not snap["unaligned_exact"]
-                )
-                self.top_unaligned_quiet.add(
-                    token, snap["book_status"], snap["gamma_status"], bool(snap["unaligned_top_mismatch"])
-                )
-            if not exact:
-                for key in ("extra", "missing", "size_diff"):
-                    miss_diff[key] += diff_b[key] + diff_a[key]
-                delta = None if last_ts is None else snap["ts"] - last_ts
-                tie = delta is not None and 0 <= delta <= 5
-                self.aligned_misses.append(
-                    {
-                        "token": token,
-                        "question": self.questions.get(token, ""),
-                        "gamma_status": snap["gamma_status"],
-                        "snapshot_ts": snap["ts"],
-                        "last_applied_ts": last_ts,
-                        "delta_ms": delta,
-                        "events_within_5ms": within_5ms,
-                        "class": "tie" if tie else "divergence",
-                        "bids": diff_b,
-                        "asks": diff_a,
-                    }
-                )
+                if not anchored or snap["ts"] is None:
+                    continue
+                diff_b = levels_diff(bids, snap["bids"])
+                diff_a = levels_diff(asks, snap["asks"])
+                exact = diff_b["exact"] == 1 and diff_a["exact"] == 1
+                quiet = self._quiet(token, snap["ts"])
+                self.level_aligned.add(token, snap["book_status"], snap["gamma_status"], not exact)
+                top = quote_verdict(bids, asks, *_rest_top(snap["bids"], snap["asks"]))
+                self.top_aligned.add(token, snap["book_status"], snap["gamma_status"], top["verdict"] == "mismatch")
+                if top["crossed"]:
+                    self.crossed_at_snapshot["aligned"] += 1
+                if quiet:
+                    self.level_aligned_quiet.add(token, snap["book_status"], snap["gamma_status"], not exact)
+                    self.top_aligned_quiet.add(
+                        token, snap["book_status"], snap["gamma_status"], top["verdict"] == "mismatch"
+                    )
+                if quiet and snap["unaligned_exact"] is not None:
+                    self.level_unaligned_quiet.add(
+                        token, snap["book_status"], snap["gamma_status"], not snap["unaligned_exact"]
+                    )
+                    self.top_unaligned_quiet.add(
+                        token, snap["book_status"], snap["gamma_status"], bool(snap["unaligned_top_mismatch"])
+                    )
+                if not exact:
+                    for key in ("extra", "missing", "size_diff"):
+                        miss_diff[key] += diff_b[key] + diff_a[key]
+                    delta = None if last_ts is None else snap["ts"] - last_ts
+                    tie = delta is not None and 0 <= delta <= 5
+                    self.aligned_misses.append(
+                        {
+                            "token": token,
+                            "question": self.questions.get(token, ""),
+                            "gamma_status": snap["gamma_status"],
+                            "snapshot_ts": snap["ts"],
+                            "last_applied_ts": last_ts,
+                            "delta_ms": delta,
+                            "events_within_5ms": within_5ms,
+                            "class": "tie" if tie else "divergence",
+                            "bids": diff_b,
+                            "asks": diff_a,
+                        }
+                    )
         for token, ts, book_status, gamma_status, mismatch in self.quote_rows:
             if self._quiet(token, ts, ignore_one=ts):
                 self.quote_quiet.add(token, book_status, gamma_status, mismatch)
@@ -631,54 +895,32 @@ class BookReplay:
             "aligned_level_misses": self.aligned_misses,
             "aligned_level_miss_levels": miss_diff,
             "resolved_quote_histogram": self._resolved_histogram(),
+            "quote_tie": self._quote_tie_report(),
+            "token_recv_wall_backward": self.token_wall_backward,
         }
 
-    def book_asof(self, token: str, recv_wall: str) -> dict:
-        """Tape-order book using events whose recv_wall is <= `recv_wall`.
+    def reset_cursors(self) -> None:
+        self._cursors.clear()
 
-        A gap clears and freezes the token until the next anchor. Ended is the
-        recv time of the record that tripped `end_after` consecutive 404s.
+    def book_asof(self, token: str, recv_wall: str, *, same_ms: str = "tape") -> dict:
+        """Book at recv_wall via a forward-only cursor. Never rescans.
+
+        same_ms is "tape" (recv order), "defer" (drop the received same-server-ms
+        group), or "both" (a dict with those two views). "both" is how a fill
+        reports the range across the two same-ms orderings.
         """
-        asof = iso_to_ns(recv_wall)
-        bids = Side(high=True)
-        asks = Side(high=False)
-        anchored = False
-        gap_frozen = False
-        for mut in self.muts[token]:
-            wall = mut[-1]
-            if not isinstance(wall, str):
-                raise ValueError(f"token {token} event has no recv_wall; cannot apply latency")
-            if iso_to_ns(wall) > asof:
-                continue
-            kind = mut[0]
-            if kind == "gap":
-                bids.clear()
-                asks.clear()
-                anchored = False
-                gap_frozen = True
-                continue
-            if kind == "px":
-                if not anchored:
-                    continue
-                side, price, size = mut[3], mut[4], mut[5]
-                if side == "BUY":
-                    bids.apply(price, size)
-                elif side == "SELL":
-                    asks.apply(price, size)
-                continue
-            bids = _load(mut[3], high=True)
-            asks = _load(mut[4], high=False)
-            anchored = True
-            gap_frozen = False
-        ended_wall = self.ended_recv_wall.get(token)
-        ended = ended_wall is not None and iso_to_ns(ended_wall) <= asof
-        return {
-            "bids": bids,
-            "asks": asks,
-            "anchored": anchored,
-            "gap_frozen": gap_frozen,
-            "ended": ended,
-        }
+        if same_ms not in ("tape", "defer", "both"):
+            raise ValueError("same_ms must be tape, defer, or both")
+        cursor = self._cursors.get(token)
+        if cursor is None:
+            cursor = BookCursor(self, token)
+            self._cursors[token] = cursor
+        cursor.advance(iso_to_ns(recv_wall))
+        if same_ms == "defer":
+            return cursor.view(defer=True)
+        if same_ms == "both":
+            return {"tape": cursor.view(), "defer_same_ms": cursor.view(defer=True)}
+        return cursor.view()
 
     def _resolved_histogram(self) -> dict:
         to_ended: list[float] = []
@@ -732,6 +974,77 @@ class BookReplay:
             ),
         }
 
+    def _quote_tie_report(self) -> dict:
+        """Same-server-timestamp ties, either tape order.
+
+        A quote mismatch is a tie when ws_count for that token and server
+        timestamp is at least 2. The mismatch's own event is one of those.
+        The other event may sit earlier or later on the tape.
+        """
+
+        def pack(gamma: str) -> dict:
+            rows = [row for row in self.quote_mismatches if row[2] == gamma]
+            tie = 0
+            no_ts = 0
+            for token, ts, _gamma in rows:
+                if ts is None:
+                    no_ts += 1
+                    continue
+                if self.ws_count[token][ts] >= 2:
+                    tie += 1
+            total = len(rows)
+            not_tie = total - tie
+            return {
+                "mismatches": total,
+                "tie": tie,
+                "not_tie": not_tie,
+                "no_server_ts": no_ts,
+                "tie_fraction": None if total == 0 else tie / total,
+            }
+
+        ws_by: Counter[str] = Counter()
+        for token, stamps in self.ws_ts.items():
+            ws_by[self.market_class.get(token, "unknown")] += len(stamps)
+        mis_by: Counter[str] = Counter()
+        for token, _ts, _gamma in self.quote_mismatches:
+            mis_by[self.market_class.get(token, "unknown")] += 1
+
+        def rate(bucket: str) -> dict:
+            events = ws_by[bucket]
+            mismatches = mis_by[bucket]
+            return {
+                "ws_events": events,
+                "mismatches": mismatches,
+                "per_1000_ws": None if events == 0 else 1000 * mismatches / events,
+            }
+
+        in_play_events = ws_by["esports_in_play"] + ws_by["sports_in_play"]
+        in_play_mis = mis_by["esports_in_play"] + mis_by["sports_in_play"]
+        resolved = pack("resolved")
+        opened = pack("open")
+        return {
+            "definition": (
+                "tie = another WS event for the same token with the same server timestamp, "
+                "earlier or later on the tape. not_tie is everything else, including a missing timestamp."
+            ),
+            "resolved": resolved,
+            "open": opened,
+            "ties_dominate": bool(
+                resolved["mismatches"] and resolved["tie"] > resolved["not_tie"]
+            ),
+            "per_1000_ws": {
+                "esports_in_play": rate("esports_in_play"),
+                "sports_in_play": rate("sports_in_play"),
+                "in_play": {
+                    "ws_events": in_play_events,
+                    "mismatches": in_play_mis,
+                    "per_1000_ws": None if in_play_events == 0 else 1000 * in_play_mis / in_play_events,
+                },
+                "other": rate("other"),
+                "unknown": rate("unknown"),
+            },
+        }
+
     def _score_quote(
         self,
         index: int,
@@ -753,7 +1066,10 @@ class BookReplay:
         gamma_status = self.gamma.get(token, "unknown")
         mismatch = view["verdict"] == "mismatch"
         self.quote.add(token, book_status, gamma_status, mismatch)
-        self.quote_rows.append((token, ts, book_status, gamma_status, mismatch))
+        if self.keep_quote_rows:
+            self.quote_rows.append((token, ts, book_status, gamma_status, mismatch))
+        if mismatch:
+            self.quote_mismatches.append((token, ts, gamma_status))
         if mismatch and gamma_status == "resolved":
             self.resolved_quote_walls.append((token, recv_wall or ""))
         if mismatch and len(self.mismatches) < self.mismatch_limit:

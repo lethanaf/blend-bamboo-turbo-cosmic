@@ -231,7 +231,7 @@ One full soak replay, same machine, same checks (including the aligned rebuild o
 
 Refused, and not a fill: crossed local book (`best bid >= best ask`), unanchored token, token frozen by a gap (cleared until the next anchor), ended token (the recv time of the record that tripped `end_after` 404s is `<=` the evaluation time). A walk that takes some but not all of the requested size is `partial`. The unfilled remainder is not a fill. An empty opposite side is `unfilled`, not a fill. Slippage is vwap minus touch on a buy, and touch minus vwap on a sell.
 
-The book is the tape-order book of events with `recv_wall <= decision recv time + latency` (`BookReplay.book_asof`). Latency is the caller's number.
+The book is the tape-order book of events with `recv_wall <= decision recv time + latency` (`BookReplay.book_asof`). Latency is the caller's number. `same_ms="both"` also returns the other same-server-timestamp reading, described below.
 
 Fee, from the market's `feeSchedule`, not from `base_fee` and not from the category table:
 
@@ -239,10 +239,78 @@ Fee, from the market's `feeSchedule`, not from `base_fee` and not from the categ
 fee = C × rate × p × (1 - p)
 ```
 
-per walked level, then summed. `C` is the shares taken at that level and `p` is that level's price. Rounded to 5 decimal places, and a rounded result below 0.00001 is 0. `half-up` and `half-even` are both implemented; the Fees page does not say which. `rebateRate` is not credited. `fees_enabled` false (or 0) pays 0. A rate of 0 pays 0. `exponent != 1` raises `FeeError`, because [Market Details](https://docs.polymarket.com/market-data/market-details) says the exponent is applied to the price component and the published formula is only that curve at exponent 1. Every schedule in the soak catalog had exponent 1 (33 markets). The two `fees_enabled=0` markets have no schedule.
+per walked level, then summed. `C` is the shares taken at that level and `p` is that level's price. One visible level is one match. Rounded to 5 decimal places, and a rounded result below 0.00001 is 0. `half-up` and `half-even` are both implemented; the Fees page does not say which. `fee_per_match_vs_per_order` sums the raw level fees and rounds once. That number is a sensitivity, not the fee. The Fees page applies the fee at match time, and this tape cannot see the maker orders inside a level. `rebateRate` is not credited. `fees_enabled` false (or 0) pays 0. A rate of 0 pays 0. `exponent != 1` raises `FeeError`, because [Market Details](https://docs.polymarket.com/market-data/market-details) says the exponent is applied to the price component and the published formula is only that curve at exponent 1. Every schedule in the soak catalog had exponent 1 (33 markets). The two `fees_enabled=0` markets have no schedule.
 
 Half-up versus half-even, same formula: 100 shares at 0.50 with rate 0.07 is 1.75000 either way (the crypto row of the fee table). They differ on an exact half at the 6th decimal: raw 0.000005 is 0.00001 half-up and 0 half-even; raw 0.000025 is 0.00003 half-up and 0.00002 half-even; raw 0.000015 is 0.00002 either way.
 
 Asset, read 2026-10-04. [Fees](https://docs.polymarket.com/trading/fees) says taker fees are calculated in **USDC** and does not name a different asset for buys and for sells. [Maker rebates](https://docs.polymarket.com/programs/maker-rebates) calls that same amount **pUSD** and pays rebates in pUSD, again with no buy/sell split. The older "collected in shares on buys, USDC on sells" sentence is not on either page (the old learn URLs redirect here). This fill charges the formula in USDC on both buys and sells and does not reduce the share count on a buy. The rebates page's sports taker rate is now 0.05, matching the fees page. The catalog still has one `sports_fees_v2` market at 0.03 and 21 `sports_fees_v3` at 0.05. A fill uses that market's `feeSchedule`.
 
-The final-window behaviour above is unmodeled. `TakerFill.lines()` prints this beside every number: of 30976 resolved-market quote mismatches, 18 are in the first 3s; 9106 have no ended index and no `market_resolved` on the tape; of 21870 with an ended index, none are in the final 5 min (minimum 572s before the 404, median 3351s); of those 21870, 1968 are in the final 60s before `market_resolved` and the rest are at least 30 min earlier.
+`TakerFill.lines()` prints one caveat beside every number. With no report loaded, the text is `unmodeled: quote mismatches are not adjusted for in this number`. `caveat_from_report` reads `quote_tape_order` from a replay JSON and prints the counts from that file. It does not hard-code a final-window sentence. The histogram above is not a final-window effect.
+
+## Quote mismatches are same-server-timestamp ties
+
+A quote mismatch is a **tie** when another WS event for the same token has the same server timestamp, earlier or later on the tape. The mismatch's own event counts as one. A missing timestamp is not a tie. This is not the 5ms aligned-level rule above.
+
+| Population | Mismatches | Tie | Not a tie | Tie fraction |
+|---|---:|---:|---:|---:|
+| Gamma resolved | 30,976 | 28,382 | 2,594 | 91.6% |
+| Gamma open | 292 | 248 | 44 | 84.9% |
+
+Ties dominate both populations.
+
+Mismatches per 1,000 WS events. A WS event is one `note_ws`: a `book`, each `price_change`, a `best_bid_ask`, a `last_trade_price`, or a `tick_size_change`. Slug prefixes: esports in play `cs2-` `dota2-` `lol-` `val-`; sports in play `fif-` `unl-` `es2-` `wta-`; everything else is other, including long-dated sports and bitcoin.
+
+| Bucket | WS events | Mismatches | Per 1,000 |
+|---|---:|---:|---:|
+| Esports in play | 1,254,159 | 16,452 | 13.12 |
+| Sports in play | 435,567 | 14,524 | 33.35 |
+| In play (those two) | 1,689,726 | 30,976 | 18.33 |
+| Other | 119,697 | 292 | 2.44 |
+
+On this soak every resolved-market mismatch sits on an in-play slug, and every open-market mismatch sits on an other slug. That is the mismatch split, not a claim that every other market is still open (bitcoin-above-74k is resolved and contributed none of the 30,976).
+
+Because ties dominate, `book_asof(..., same_ms="both")` returns two books. `tape` applies the group in recv order. `defer` is the book from before that server timestamp, and only while the query lands on the group. Once the query is strictly later than the last mutation of that timestamp, defer collapses to tape. It is not a permutation of repeated writes to the same price. A fill reports the range between those two readings. The lock-in scan below had no positive net on either reading.
+
+Quote checks on this pass were unchanged: 31,268 / 1,766,236. The caveat loaded from that report is `unmodeled: 31268 quote mismatches out of 1766236 checks are not adjusted for in this number`.
+
+## Forward cursor
+
+`book_asof` keeps one cursor per token. It applies each mutation once and never rescans. A query that goes backward raises.
+
+`recv_wall` is not monotonic inside a session. `RecvClock` counted **64** backward `recv_wall` steps and **64** backward `recv_monotonic_ns` steps, on 3 sessions, all on `connection_id` `0`. Every backward wall value falls between `2026-10-03T15:22:30.444829+00:00` and `2026-10-03T15:23:04.586075+00:00`, which is the stray second writer. That writer reused connection id 0, so the monotonic clock is a different process epoch and steps backward on the same records. It is not a usable fallback.
+
+The cursor stays on `recv_wall`. A stamp earlier than the previous one is clamped to that previous stamp and the event is still applied once, in tape order. The high-water clamp fired on **534** mutations. The ingest counter `token_recv_wall_backward` is **170**: it adopts the earlier wall as the new last, so it counts step-downs, not every mutation under the high-water mark.
+
+10,000 forward queries, cold cursors, sampled in time order across the soak muts: **8.736s** (874 µs each). That includes each sampled token's one-time `recv_wall` parse. The full binary scan below then walked every event in about 50s.
+
+## Lock-in scan
+
+`scripts/scan_lockin.py` does not send orders and does not change `live_trading`. It buys both tokens of one condition at the ask. Net per share is `1 - (ask_yes + ask_no)` minus taker fees on both legs, from that market's `feeSchedule`, one match per leg. Touch size is the min of the two ask sizes. The catalog minimum is 5 shares on all 35 markets. Below that is not executable. One shot per window, not a sum of every tick. Windows can overlap across markets, so a sum would not be a portfolio. There were no windows.
+
+Gamma is the payoff source. A complete set pays 1 USDC per share. 44 tokens are Gamma-resolved; 20 of them have a `market_resolved` frame on the tape and **24 do not**. Both tokens resolved: that 1 is already determined. Both open: it is paid at resolution. Mixed pairs: none in this catalog.
+
+Latency is the arrival book at the decision time plus 0, 100, 250, or 500 ms, through `book_asof`. A latency-0 window is a maximal interval where the after-fee net is positive. It survives a latency only if the arrival book at that later time is still net-positive.
+
+| | Result |
+|---|---|
+| Binary markets scanned | 35 |
+| Decision times | 886,490 |
+| Tightest ask sum, either size | 1.001 |
+| Both asks, size ≥ 5, sum ≥ 1 | 856,177 |
+| Size below 5 | 4,502, and none of those sums were under 1 |
+| Fee-killed intervals (gross > 0, net ≤ 0) | 0 |
+| Net-positive windows | 0 |
+| Still positive at 100 / 250 / 500 ms | 0 / 0 / 0 |
+| Return per day | no shot |
+
+Refused and not counted as edge: leg A unanchored 5, leg B unanchored 30, leg A gap-frozen 32, leg B gap-frozen 3, leg A crossed 491, leg A no ask 14,542, leg B no ask 10,708.
+
+**No executable touch had `ask_yes + ask_no < 1`.** Fees never had a gross edge to take. Latency has nothing to keep. There is no duration distribution, no touch size, and no return per day.
+
+Neg-risk multi-outcome sets were not summed. A sum of outcome asks pays 1 only if the catalog holds every outcome. The stored event payload has no sibling market list and no outcome count, so every group is incomplete. Nine groups: Brazil 3, balance of power 2, Finland/Albania 2, and one each for the Fed, Shakhtar, England, Eibar, Spain, and the House. Yes+No of one of those conditions is already in the binary scan. The group sum is not.
+
+Not modeled, and not in the numbers above: gas, queue position, rejects, one leg filling and the other missing, walking past the touch, a true per-match fee versus one fee per visible price level, voids (the gamma file has no void flag), rebates. The per-order rounding sensitivity had no shot to move.
+
+`unmodeled: 31268 quote mismatches out of 1766236 checks are not adjusted for in this number`
+
+The dump is `data/replay/lockin_scan.json`. It does not replace `data/replay/soak_report.json`.
