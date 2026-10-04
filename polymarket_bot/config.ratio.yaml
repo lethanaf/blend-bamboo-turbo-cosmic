@@ -1,0 +1,42 @@
+# Phase 1 records public data only. Live orders do not exist yet.
+# record.py refuses to start if this is true.
+live_trading: false
+
+gamma_base: https://gamma-api.polymarket.com
+clob_base: https://clob.polymarket.com
+ws_market: wss://ws-subscriptions-clob.polymarket.com/ws/market
+
+# Open, order-book-enabled markets, highest 24h volume first.
+max_markets: 30
+market_order: volume24hr
+market_order_ascending: false
+gamma_page_size: 100
+gamma_max_pages: 10
+
+# Official AsyncAPI SubscriptionRequest.assets_ids has no maxItems
+# (https://docs.polymarket.com/asyncapi.json). null = one connection.
+# Set a positive integer only to shard; markets are not split across sockets.
+ws_assets_per_connection: null
+
+# Text frame "PING" every 10s, per the market-channel docs. Protocol pings are off.
+ping_interval_s: 10
+reconnect_backoff_initial_s: 1
+reconnect_backoff_max_s: 30
+ws_stale_s: 30
+# After a socket has stayed up this long, the next reconnect wait starts at the initial backoff.
+backoff_reset_after_s: 30
+# Mid-stream GET /book for every subscribed token. reason=periodic.
+reconcile_interval_s: 300
+# Buffer tape lines into one gzip member.
+jsonl_flush_interval_s: 1
+jsonl_flush_records: 500
+
+rest_book_concurrency: 4
+http_timeout_s: 30
+http_attempts: 3
+
+# custom_feature_enabled also delivers connection-wide new_market / market_resolved.
+custom_feature_enabled: true
+
+data_dir: data/ratio2m
+log_level: INFO
