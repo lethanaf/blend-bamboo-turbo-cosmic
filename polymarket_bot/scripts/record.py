@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from pmbot.config import LiveTradingDisabled, load_config  # noqa: E402
+from pmbot.data.lockfile import DataDirBusy  # noqa: E402
 from pmbot.data.recorder import run_recorder  # noqa: E402
 from pmbot.logging_setup import setup_logging  # noqa: E402
 
@@ -28,6 +29,9 @@ def main() -> None:
     except LiveTradingDisabled as exc:
         print(exc, file=sys.stderr)
         raise SystemExit(2) from exc
+    except DataDirBusy as exc:
+        print(exc, file=sys.stderr)
+        raise SystemExit(3) from exc
 
 
 if __name__ == "__main__":

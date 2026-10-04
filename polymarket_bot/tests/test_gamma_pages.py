@@ -36,3 +36,29 @@ def test_discovery_stops_once_the_universe_is_full() -> None:
         assert calls["n"] == 1
 
     asyncio.run(run())
+
+
+def test_refresh_skips_known_markets_and_keeps_reading() -> None:
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        page = []
+        for index in range(100):
+            item = dict(FIXTURE)
+            item["conditionId"] = f"0x{calls['n']:02d}{index:02d}"
+            item["id"] = f"{calls['n']}-{index}"
+            page.append(item)
+        return httpx.Response(200, json=page)
+
+    async def run() -> None:
+        config = load_config(Path(__file__).resolve().parents[1] / "config.yaml")
+        config = replace(config, max_markets=30, gamma_page_size=100, gamma_max_pages=10)
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport, base_url=config.gamma_base) as http:
+            markets = await discover_markets(http, config, skip={"0x0100"}, limit=1)
+        assert len(markets) == 1
+        assert markets[0].condition_id != "0x0100"
+        assert calls["n"] == 1
+
+    asyncio.run(run())

@@ -44,6 +44,8 @@ class Config:
     custom_feature_enabled: bool
     data_dir: Path
     log_level: str
+    book_404_end_after: int = 3
+    gamma_refresh_interval_s: float = 1800.0
 
     @property
     def sqlite_path(self) -> Path:
@@ -122,4 +124,6 @@ def load_config(path: Path) -> Config:
         custom_feature_enabled=as_bool("custom_feature_enabled", True),
         data_dir=data_dir,
         log_level=str(raw.get("log_level", "INFO")),
+        book_404_end_after=as_int("book_404_end_after", 3, 1),
+        gamma_refresh_interval_s=as_float("gamma_refresh_interval_s", 1800, 1),
     )
