@@ -82,6 +82,7 @@ class HourlyJsonl:
         self._last_flush_ns: int | None = None
         self.members_written = 0
         self.uncompressed_bytes = 0
+        self.bytes_written = 0
         # One id per writer process. Two recorders sharing a directory no longer
         # look like one connection_id "0".
         self.session_id = str(uuid.uuid4())
@@ -118,6 +119,7 @@ class HourlyJsonl:
         self._last_flush_ns = self.clock.monotonic_ns()
         self.members_written += 1
         self.uncompressed_bytes += len(payload)
+        self.bytes_written += len(member)
 
     def close(self) -> None:
         self.flush()

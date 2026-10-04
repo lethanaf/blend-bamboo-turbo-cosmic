@@ -20,7 +20,7 @@ import heapq
 from decimal import Decimal
 
 from pmbot.data.bookbuild import BookReplay, iso_to_ns, ns_to_iso
-from pmbot.data.fill import fee_per_match_vs_per_order, taker_fee
+from pmbot.data.fill import fee_per_match_vs_per_order
 
 LATENCIES_MS = (100, 250, 500)
 
@@ -41,6 +41,7 @@ def set_edge(
     min_size: Decimal,
     side: str = "buy",
     rounding: str = "half-up",
+    leg_fees: list[tuple[dict | None, bool | None]] | None = None,
 ) -> dict | None:
     """Edge of one complete set at the touch.
 
@@ -48,11 +49,15 @@ def set_edge(
     `sell` mints one set for 1 USDC and hits every bid. Gross per share is
     `sum(bids) - 1`. Fees are taker fees, one match per leg. `per_order_net`
     rounds the summed raw fees once and is the sensitivity, not the net.
+    `leg_fees` charges each leg from its own market when a neg-risk set spans
+    more than one feeSchedule. Omit it and every leg uses `fee_schedule`.
     """
     if side not in ("buy", "sell"):
         raise ValueError("side must be buy or sell")
     if len(levels) < 2 or any(size <= 0 for _price, size in levels):
         return None
+    if leg_fees is not None and len(leg_fees) != len(levels):
+        raise ValueError("leg_fees must match levels")
     size = min(size for _price, size in levels)
     prices = [price for price, _size in levels]
     price_sum = sum(prices, Decimal(0))
@@ -67,19 +72,14 @@ def set_edge(
             "price_sum": price_sum,
             "side": side,
         }
-    fees = sum(
-        (
-            taker_fee(size, price, fee_schedule, fees_enabled=fees_enabled, rounding=rounding)
-            for price in prices
-        ),
-        Decimal(0),
-    )
     sens = fee_per_match_vs_per_order(
         [(size, price) for price in prices],
         fee_schedule,
         fees_enabled=fees_enabled,
         rounding=rounding,
+        leg_fees=leg_fees,
     )
+    fees = sens["per_match"]
     net = gross - fees
     if side == "buy":
         cost = size * price_sum + fees
@@ -197,6 +197,7 @@ def touch_edge(
     fees_enabled: bool | None,
     min_size: Decimal,
     side: str = "buy",
+    leg_fees: list[tuple[dict | None, bool | None]] | None = None,
 ) -> dict:
     """Complete-set touch. Buy lifts asks. Sell mints and hits bids.
 
@@ -216,7 +217,14 @@ def touch_edge(
         if book.best is None or book.best_size is None or book.best_size <= 0:
             return {"status": "blocked", "reason": f"{label}_{missing}"}
         levels.append((book.best, book.best_size))
-    edge = set_edge(levels, fee_schedule, fees_enabled=fees_enabled, min_size=min_size, side=side)
+    edge = set_edge(
+        levels,
+        fee_schedule,
+        fees_enabled=fees_enabled,
+        min_size=min_size,
+        side=side,
+        leg_fees=leg_fees,
+    )
     if edge is None:
         return {"status": "blocked", "reason": missing}
     edge["price_sum"] = edge["price_sum"]
@@ -291,6 +299,7 @@ def scan_binary_pair(
     latencies_ms: tuple[int, ...] = LATENCIES_MS,
     side: str = "buy",
     tokens: list[str] | None = None,
+    leg_fees: list[tuple[dict | None, bool | None]] | None = None,
 ) -> dict:
     """Maximal net>0 intervals on the arrival book, then a shot at each latency.
 
@@ -306,6 +315,8 @@ def scan_binary_pair(
     legs = [token_a, token_b] if tokens is None else list(tokens)
     if len(legs) < 2:
         raise ValueError("a complete set needs at least two tokens")
+    if leg_fees is not None and len(leg_fees) != len(legs):
+        raise ValueError("leg_fees must match tokens")
     times = _times(replay, *legs)
     windows: list[dict] = []
     fee_killed_intervals = 0
@@ -329,10 +340,20 @@ def scan_binary_pair(
             tape_views.append(both["tape"])
             defer_views.append(both["defer_same_ms"])
         tape = touch_edge(
-            tape_views, fee_schedule, fees_enabled=fees_enabled, min_size=min_size, side=side
+            tape_views,
+            fee_schedule,
+            fees_enabled=fees_enabled,
+            min_size=min_size,
+            side=side,
+            leg_fees=leg_fees,
         )
         defer = touch_edge(
-            defer_views, fee_schedule, fees_enabled=fees_enabled, min_size=min_size, side=side
+            defer_views,
+            fee_schedule,
+            fees_enabled=fees_enabled,
+            min_size=min_size,
+            side=side,
+            leg_fees=leg_fees,
         )
         return tape, defer
 
@@ -474,6 +495,7 @@ def scan_outcome_set(
     end_ns: int | None,
     latencies_ms: tuple[int, ...] = LATENCIES_MS,
     side: str = "buy",
+    leg_fees: list[tuple[dict | None, bool | None]] | None = None,
 ) -> dict:
     """Same windows as `scan_binary_pair`, for every YES token of a complete set."""
     return scan_binary_pair(
@@ -487,4 +509,5 @@ def scan_outcome_set(
         latencies_ms=latencies_ms,
         side=side,
         tokens=tokens,
+        leg_fees=leg_fees,
     )

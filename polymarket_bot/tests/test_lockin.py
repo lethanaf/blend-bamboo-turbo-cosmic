@@ -336,6 +336,21 @@ def test_three_outcome_yes_sum_pays_one_after_fees() -> None:
     assert scanned["windows"][0]["net"] == Decimal("1") - Decimal("0.25200")
 
 
+def test_each_leg_uses_its_own_fee_schedule() -> None:
+    cheap = {"rate": "0", "exponent": 1}
+    edge = set_edge(
+        [(Decimal("0.30"), Decimal("10")), (Decimal("0.30"), Decimal("10"))],
+        SCHEDULE,
+        fees_enabled=True,
+        min_size=Decimal("1"),
+        leg_fees=[(SCHEDULE, True), (cheap, True)],
+    )
+    assert edge is not None
+    assert edge["fees"] == Decimal("0.08400")
+    assert edge["gross"] == Decimal("4")
+    assert edge["net"] == Decimal("4") - Decimal("0.08400")
+
+
 def test_lockin_window_is_one_shot_and_dies_when_latency_sees_the_next_book() -> None:
     replay = BookReplay()
     t0 = "2026-10-03T14:00:00+00:00"

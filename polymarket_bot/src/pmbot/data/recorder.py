@@ -14,7 +14,6 @@ from pmbot.data.book import top_of_book
 from pmbot.data.clob_rest import get_book, get_fee_rate, get_ok, get_server_time
 from pmbot.data.clob_ws import MarketConnection
 from pmbot.data.gamma import discover_diversified, discover_markets
-from pmbot.data.universe import ending_within
 from pmbot.data.lockfile import DataDirLock
 from pmbot.data.models import ParsedMarket
 from pmbot.data.shard import oversized_groups, shard_markets
@@ -22,6 +21,9 @@ from pmbot.data.store import Store
 from pmbot.httputil import client
 
 log = logging.getLogger(__name__)
+
+# One line on the same cadence as a long --seconds run, without stopping it.
+PROGRESS_INTERVAL_S = 600
 
 
 class Recorder:
@@ -49,6 +51,9 @@ class Recorder:
         self.live_connections: list[MarketConnection] = []
         self._conn_tasks: list[asyncio.Task] = []
         self._stop: asyncio.Event | None = None
+        # Condition ids dropped because they end inside the horizon. A later
+        # refresh passes them in `skip` so they cannot fill the next page again.
+        self.skipped_ending: set[str] = set()
 
     async def __aenter__(self) -> Recorder:
         self.http = client(self.config.clob_base, self.config.http_timeout_s)
@@ -215,14 +220,20 @@ class Recorder:
             return []
         known = {market.condition_id for market in self.markets}
         async with client(self.config.gamma_base, self.config.http_timeout_s) as gamma:
-            found = await discover_markets(gamma, self.config, skip=known, limit=slots)
-        if self.config.universe == "diversified":
-            now = self.clock.wall()
-            found = [
-                market
-                for market in found
-                if not ending_within(market.end_date, now, self.config.exclude_ending_within_s)
-            ]
+            if self.config.universe == "diversified":
+                skip = set(known)
+                skip.update(self.skipped_ending)
+                found = await discover_markets(
+                    gamma,
+                    self.config,
+                    skip=skip,
+                    limit=slots,
+                    now=self.clock.wall(),
+                    exclude_ending_within_s=self.config.exclude_ending_within_s,
+                )
+                self.skipped_ending = {condition_id for condition_id in skip if condition_id not in known}
+            else:
+                found = await discover_markets(gamma, self.config, skip=known, limit=slots)
         if not found:
             log.info("gamma refresh added=0 live=%s", len(live))
             return []
@@ -415,6 +426,27 @@ class Recorder:
                 except Exception:
                     log.exception("gamma refresh failed")
 
+    def progress_line(self) -> str:
+        """One status line: messages, markets still live, ended tokens, gaps, MB flushed."""
+        live = sum(
+            1
+            for market in self.markets
+            if any(token_id not in self.ended for token_id in market.token_ids)
+        )
+        mb = self.store.tape.bytes_written / (1024 * 1024)
+        return (
+            f"progress messages={self.messages} markets_live={live} "
+            f"ended={len(self.ended)} gaps={self.gaps} mb_written={mb:.2f}"
+        )
+
+    async def _progress_loop(self, stop: asyncio.Event, interval_s: float = PROGRESS_INTERVAL_S) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval_s)
+                return
+            except TimeoutError:
+                log.info("%s", self.progress_line())
+
     async def _flush_loop(self, stop: asyncio.Event) -> None:
         interval = self.config.jsonl_flush_interval_s
         while not stop.is_set():
@@ -436,9 +468,14 @@ class Recorder:
             asyncio.create_task(self._reconcile_loop(stop, token_ids)),
             asyncio.create_task(self._flush_loop(stop)),
             asyncio.create_task(self._gamma_refresh_loop(stop)),
+            asyncio.create_task(self._progress_loop(stop)),
         ]
         try:
             await stop.wait()
+        except KeyboardInterrupt:
+            # Ctrl+C on a loop that could not install a signal handler.
+            log.info("keyboard interrupt; shutting down")
+            stop.set()
         finally:
             for task in extra:
                 task.cancel()
@@ -472,8 +509,6 @@ async def run_recorder(config: Config, seconds: float | None = None) -> None:
 
         timer = asyncio.create_task(_stop_later())
     loop = asyncio.get_running_loop()
-    import signal
-
     recorder_box: dict[str, Recorder] = {}
 
     def _on_usr1() -> None:
@@ -482,6 +517,43 @@ async def run_recorder(config: Config, seconds: float | None = None) -> None:
         if recorder is not None:
             recorder.abort_sockets()
 
+    restore_signals = install_stop_signals(loop, stop, on_usr1=_on_usr1)
+    try:
+        async with Recorder(config) as recorder:
+            recorder_box["recorder"] = recorder
+            await recorder.run(stop)
+    finally:
+        restore_signals()
+        if timer is not None:
+            timer.cancel()
+        lock.release()
+
+
+def install_stop_signals(loop, stop: asyncio.Event, *, on_usr1=None):
+    """Make SIGINT and SIGTERM set `stop`.
+
+    `loop.add_signal_handler` is used when the loop implements it. Windows
+    raises NotImplementedError. `signal.signal` then turns Ctrl+C into the
+    same stop event, so the sockets write session_stop and the tape flushes
+    instead of dying on KeyboardInterrupt.
+
+    Returns a callback that restores the previous handlers.
+    """
+    import signal
+
+    restores: list = []
+
+    def fallback(sig: int) -> None:
+        def handler(signum, frame) -> None:
+            loop.call_soon_threadsafe(stop.set)
+
+        previous = signal.signal(sig, handler)
+
+        def restore(sig: int = sig, previous=previous) -> None:
+            signal.signal(sig, previous)
+
+        restores.append(restore)
+
     for sig_name in ("SIGINT", "SIGTERM"):
         sig = getattr(signal, sig_name, None)
         if sig is None:
@@ -489,17 +561,30 @@ async def run_recorder(config: Config, seconds: float | None = None) -> None:
         try:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
-            pass
-    if hasattr(signal, "SIGUSR1"):
+            try:
+                fallback(sig)
+            except (ValueError, OSError):
+                continue
+        else:
+
+            def remove(sig: int = sig) -> None:
+                loop.remove_signal_handler(sig)
+
+            restores.append(remove)
+
+    if on_usr1 is not None and hasattr(signal, "SIGUSR1"):
         try:
-            loop.add_signal_handler(signal.SIGUSR1, _on_usr1)
+            loop.add_signal_handler(signal.SIGUSR1, on_usr1)
         except NotImplementedError:
             pass
-    try:
-        async with Recorder(config) as recorder:
-            recorder_box["recorder"] = recorder
-            await recorder.run(stop)
-    finally:
-        if timer is not None:
-            timer.cancel()
-        lock.release()
+        else:
+            restores.append(lambda: loop.remove_signal_handler(signal.SIGUSR1))
+
+    def restore_all() -> None:
+        for item in reversed(restores):
+            try:
+                item()
+            except (ValueError, OSError, RuntimeError):
+                continue
+
+    return restore_all

@@ -33,6 +33,8 @@ def test_batches_until_flush_count(tmp_path: Path) -> None:
     path = next(tmp_path.rglob("*.jsonl.gz"))
     assert [row["kind"] for row in read_jsonl_gz(path)] == ["a", "b", "c"]
     assert tape.members_written == 1
+    assert tape.bytes_written == path.stat().st_size
+    assert tape.bytes_written > 0
 
 
 def test_interval_flush_and_truncated_tail(tmp_path: Path) -> None:

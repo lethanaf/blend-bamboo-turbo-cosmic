@@ -144,17 +144,25 @@ def fee_per_match_vs_per_order(
     *,
     fees_enabled: bool | None = None,
     rounding: str = "half-up",
+    leg_fees: list[tuple[dict | None, bool | None]] | None = None,
 ) -> dict:
     """Per-level (per match) sum versus one rounding of the summed raw fee.
 
     The Fees page applies fees at match time. Default fills use the per-match
-    figure. The per-order figure is the sensitivity only.
+    figure. The per-order figure is the sensitivity only. `leg_fees` is one
+    (schedule, fees_enabled) pair per leg when a complete set spans markets.
     """
+    if leg_fees is not None and len(leg_fees) != len(legs):
+        raise FeeError("leg_fees must match legs")
     per_match = Decimal("0")
     raw = Decimal("0")
-    for shares, price in legs:
-        per_match += taker_fee(shares, price, fee_schedule, fees_enabled=fees_enabled, rounding=rounding)
-        raw += taker_fee_raw(shares, price, fee_schedule, fees_enabled=fees_enabled)
+    for index, (shares, price) in enumerate(legs):
+        if leg_fees is None:
+            schedule, enabled = fee_schedule, fees_enabled
+        else:
+            schedule, enabled = leg_fees[index]
+        per_match += taker_fee(shares, price, schedule, fees_enabled=enabled, rounding=rounding)
+        raw += taker_fee_raw(shares, price, schedule, fees_enabled=enabled)
     per_order = _round_fee(raw, rounding)
     return {
         "per_match": per_match,

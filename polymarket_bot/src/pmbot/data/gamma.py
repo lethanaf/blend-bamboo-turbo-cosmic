@@ -12,6 +12,7 @@ from pmbot.data.models import ParsedMarket, parse_market
 from pmbot.data.universe import (
     NegRiskEvent,
     choose_complete_events,
+    ending_within,
     parse_neg_risk_event,
     select_across_categories,
 )
@@ -26,19 +27,37 @@ async def discover_markets(
     *,
     skip: set[str] | None = None,
     limit: int | None = None,
+    now: datetime | None = None,
+    exclude_ending_within_s: int | None = None,
 ) -> list[ParsedMarket]:
     """Walk volume-sorted pages until `limit` new recordable markets are found.
 
     `skip` holds condition ids already tracked. Those rows do not count toward
-    the limit, so a refresh can see past the current set.
+    the limit, so a refresh can see past the current set. When
+    `exclude_ending_within_s` is set, markets that end inside that horizon are
+    added to `skip` and do not count toward the limit either. Filtering after
+    the limit would drop a whole page of short-dated markets and refetch them
+    on the next refresh.
     """
     target = config.max_markets if limit is None else limit
     if target <= 0:
         return []
-    ignored = skip or set()
+    ignored = skip if skip is not None else set()
     chosen: list[ParsedMarket] = []
     seen: set[str] = set()
+    dropped = 0
     offset = 0
+
+    def finish() -> list[ParsedMarket]:
+        if dropped:
+            log.info(
+                "skipped %s markets ending within %ss",
+                dropped,
+                exclude_ending_within_s,
+            )
+        log.info("selected %s/%s markets", len(chosen), target)
+        return chosen
+
     for page in range(config.gamma_max_pages):
         response = await get_text(
             http,
@@ -63,16 +82,22 @@ async def discover_markets(
             parsed = parse_market(item)
             if parsed is None or parsed.condition_id in seen or parsed.condition_id in ignored:
                 continue
+            if (
+                exclude_ending_within_s is not None
+                and now is not None
+                and ending_within(parsed.end_date, now, exclude_ending_within_s)
+            ):
+                ignored.add(parsed.condition_id)
+                dropped += 1
+                continue
             seen.add(parsed.condition_id)
             chosen.append(parsed)
             if len(chosen) >= target:
-                log.info("selected %s/%s markets", len(chosen), target)
-                return chosen
+                return finish()
         if len(batch) < config.gamma_page_size:
             break
         offset += config.gamma_page_size
-    log.info("selected %s/%s markets", len(chosen), target)
-    return chosen
+    return finish()
 
 
 async def _pages(

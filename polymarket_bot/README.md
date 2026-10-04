@@ -352,3 +352,13 @@ A complete event is every sibling `GET /events` returned, each with an open book
 The complete-set scan (`scan_outcome_set`) buys every YES ask and, separately, mints and sells every YES bid. It runs only when the catalog row says the sibling list is complete. This soak catalog has no sibling list. Those sums were not taken. **Nothing survives.**
 
 No orders. `live_trading` is false.
+
+## Before the 24h run
+
+The data-directory lock uses `fcntl` on Unix and `msvcrt` on Windows, picked at runtime, so `scripts/record.py` imports on both. Ctrl+C uses `loop.add_signal_handler` when the loop has it. When that raises `NotImplementedError`, `signal.signal` sets the same stop event. Either way the sockets write `session_stop` (`reason=shutdown`) and the tape is flushed. A `KeyboardInterrupt` that still lands in `run()` sets that stop event before the drain.
+
+A diversified refresh applies `exclude_ending_within_s` inside `discover_markets`, before the limit. Markets inside the horizon are added to `skip` and kept on the recorder, so a page that all ends within 6 hours cannot fill the slot count and get requested again forever. `config.yaml` is still `universe: volume`.
+
+Every 10 minutes the process logs `progress messages= markets_live= ended= gaps= mb_written=`. `mb_written` is gzip bytes this process has flushed, divided by 1024². It is not the size of older files in the directory.
+
+`python scripts/analyze_day.py <data_dir>` replays `books/`, scores aligned levels and quote ties, scans binary buy and sell, and scans complete neg-risk sets from `neg_risk_events` (sum of YES asks, sum of YES bids, each leg's own feeSchedule, at 0/100/250/500 ms). It prints one markdown report and does not send orders. It runs on Windows and WSL. The recording was not started.
