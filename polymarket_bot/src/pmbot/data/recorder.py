@@ -13,7 +13,8 @@ from pmbot.config import Config, assert_phase1
 from pmbot.data.book import top_of_book
 from pmbot.data.clob_rest import get_book, get_fee_rate, get_ok, get_server_time
 from pmbot.data.clob_ws import MarketConnection
-from pmbot.data.gamma import discover_markets
+from pmbot.data.gamma import discover_diversified, discover_markets
+from pmbot.data.universe import ending_within
 from pmbot.data.lockfile import DataDirLock
 from pmbot.data.models import ParsedMarket
 from pmbot.data.shard import oversized_groups, shard_markets
@@ -69,7 +70,12 @@ class Recorder:
     async def catalog(self) -> list[ParsedMarket]:
         assert self.http is not None
         async with client(self.config.gamma_base, self.config.http_timeout_s) as gamma:
-            self.markets = await discover_markets(gamma, self.config)
+            if self.config.universe == "diversified":
+                self.markets, events = await discover_diversified(gamma, self.config)
+                for event in events:
+                    self.store.upsert_neg_risk_event(event)
+            else:
+                self.markets = await discover_markets(gamma, self.config)
         if not self.markets:
             raise RuntimeError("Gamma returned no recordable markets")
         for market in self.markets:
@@ -210,6 +216,13 @@ class Recorder:
         known = {market.condition_id for market in self.markets}
         async with client(self.config.gamma_base, self.config.http_timeout_s) as gamma:
             found = await discover_markets(gamma, self.config, skip=known, limit=slots)
+        if self.config.universe == "diversified":
+            now = self.clock.wall()
+            found = [
+                market
+                for market in found
+                if not ending_within(market.end_date, now, self.config.exclude_ending_within_s)
+            ]
         if not found:
             log.info("gamma refresh added=0 live=%s", len(live))
             return []

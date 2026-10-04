@@ -163,6 +163,78 @@ def _end_ns(value: str | None) -> int | None:
         return None
 
 
+def _blocked_breakdown(blocked: dict) -> dict:
+    """Decision times that were neither sum>=1 (size ok) nor below the minimum size.
+
+    First failing leg only, A before B. Inside a leg: ended, gap_frozen,
+    unanchored, crossed, then a missing ask.
+    """
+
+    def n(*keys: str) -> int:
+        return sum(int(blocked.get(key, 0)) for key in keys)
+
+    ended = n("a_ended", "b_ended")
+    gap = n("a_gap_frozen", "b_gap_frozen")
+    unanchored = n("a_unanchored", "b_unanchored")
+    crossed = n("a_crossed", "b_crossed")
+    a_no_ask = n("a_no_ask")
+    b_no_ask = n("b_no_ask")
+    return {
+        "ended": ended,
+        "gap_frozen": gap,
+        "unanchored": unanchored,
+        "crossed": crossed,
+        "a_no_ask": a_no_ask,
+        "b_no_ask": b_no_ask,
+        "a_ended": n("a_ended"),
+        "b_ended": n("b_ended"),
+        "a_gap_frozen": n("a_gap_frozen"),
+        "b_gap_frozen": n("b_gap_frozen"),
+        "a_unanchored": n("a_unanchored"),
+        "b_unanchored": n("b_unanchored"),
+        "a_crossed": n("a_crossed"),
+        "b_crossed": n("b_crossed"),
+        "total": ended + gap + unanchored + crossed + a_no_ask + b_no_ask,
+    }
+
+
+def _sell_summary(
+    windows: list[dict],
+    blocked: dict,
+    evaluations: int,
+    fee_intervals: int,
+    fee_gross: Decimal,
+    max_bid_sum: Decimal | None,
+    below_min_positive: int,
+    markets: list[dict],
+) -> dict:
+    survived = {str(latency): 0 for latency in LATENCIES_MS}
+    net_sum = Decimal("0")
+    for window in windows:
+        net_sum += window["net"]
+        for latency in LATENCIES_MS:
+            if window["latency"][str(latency)]["survived"]:
+                survived[str(latency)] += 1
+    return {
+        "note": (
+            "Mint one pair for 1 USDC and sell both bids. Gross per share is "
+            "bid_yes + bid_no - 1. Fees are taker fees on both sells. "
+            "Cost for return-per-day is the minted USDC plus fees."
+        ),
+        "windows": len(windows),
+        "net_usdc_one_shot_sum": net_sum,
+        "evaluations": evaluations,
+        "blocked": dict(blocked),
+        "fee_killed_intervals": fee_intervals,
+        "fee_killed_open_gross_sum": fee_gross,
+        "max_bid_sum": max_bid_sum,
+        "below_min_positive_gross_ticks": below_min_positive,
+        "latency_survived_tape": survived,
+        "duration_s": _duration_hist([window["duration_ns"] / 1_000_000_000 for window in windows]),
+        "markets": markets,
+    }
+
+
 def benchmark(replay: BookReplay, queries: int = 10_000) -> dict:
     rows: list[tuple[int, str, str]] = []
     for token, muts in replay.muts.items():
@@ -327,6 +399,59 @@ def main() -> None:
             flush=True,
         )
 
+    replay.reset_cursors()
+    sell_windows: list[dict] = []
+    sell_blocked: dict[str, int] = defaultdict(int)
+    sell_evaluations = 0
+    sell_fee_intervals = 0
+    sell_fee_gross = Decimal("0")
+    sell_min_size_positive = 0
+    max_bid_sum: Decimal | None = None
+    sell_market_rows = []
+    for market in markets:
+        tokens = market["tokens"]
+        if len(tokens) != 2:
+            continue
+        token_a = tokens[0]["token_id"]
+        token_b = tokens[1]["token_id"]
+        gamma = _gamma_pair(meta, token_a, token_b)
+        if gamma not in ("resolved", "open"):
+            continue
+        end_ns = _end_ns(market["end_date"])
+        scanned = scan_binary_pair(
+            replay,
+            token_a,
+            token_b,
+            fee_schedule=market["fee_schedule"],
+            fees_enabled=market["fees_enabled"],
+            min_size=market["min_size"],
+            end_ns=end_ns,
+            side="sell",
+        )
+        sell_fee_intervals += scanned["fee_killed_intervals"]
+        sell_fee_gross += scanned["fee_killed_open_gross"]
+        sell_evaluations += scanned["evaluations"]
+        sell_min_size_positive += scanned["below_min_positive"]
+        if scanned["max_bid_sum"] is not None and (max_bid_sum is None or scanned["max_bid_sum"] > max_bid_sum):
+            max_bid_sum = scanned["max_bid_sum"]
+        for reason, count in scanned["blocked"].items():
+            sell_blocked[reason] += count
+        net_sum = Decimal("0")
+        for window in scanned["windows"]:
+            window["slug"] = market["slug"]
+            window["gamma"] = gamma
+            window["end_ns"] = end_ns
+            net_sum += window["net"]
+            sell_windows.append(window)
+        sell_market_rows.append(
+            {"slug": market["slug"], "windows": len(scanned["windows"]), "net_sum": net_sum}
+        )
+        print(
+            f"sell {market['slug']} windows={len(scanned['windows'])} net={net_sum} "
+            f"fee_killed_intervals={scanned['fee_killed_intervals']}",
+            flush=True,
+        )
+
     durations = [window["duration_ns"] / 1_000_000_000 for window in all_windows]
     censored = sum(1 for window in all_windows if window["right_censored"])
     net_sum = sum((window["net"] for window in all_windows), Decimal("0"))
@@ -416,6 +541,7 @@ def main() -> None:
         "min_ask_sum": min_ask_sum,
         "below_min_positive_gross_ticks": below_min_positive,
         "below_min_positive_gross_sum": below_min_positive_gross,
+        "blocked_other_than_sum_ge_1_or_below_min": _blocked_breakdown(blocked_totals),
         "per_order_windows_that_differ": rounding_differs,
         "per_order_minus_per_match_net": per_order_delta,
         "return_per_day_count": len(returns),
@@ -427,6 +553,21 @@ def main() -> None:
         "unmodeled": list(UNMODELED),
         "markets": market_rows,
         "largest_windows": largest,
+        "sell": _sell_summary(
+            sell_windows,
+            sell_blocked,
+            sell_evaluations,
+            sell_fee_intervals,
+            sell_fee_gross,
+            max_bid_sum,
+            sell_min_size_positive,
+            sell_market_rows,
+        ),
+        "neg_risk_complete_sets": [],
+        "neg_risk_complete_note": (
+            "This catalog has no stored sibling list, so no neg-risk multi-outcome "
+            "set is complete. Asks were not summed and bids were not summed."
+        ),
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(_jsonable(summary), indent=2, sort_keys=True), encoding="utf-8")
@@ -441,6 +582,20 @@ def main() -> None:
     print(f"latency_survived_tape={latency_survived} latency_survived_defer={latency_defer}")
     print(f"duration={summary['duration_s']}")
     print(f"return_per_day count={len(returns)} missing_end={end_missing} already_past={end_past}")
+    breakdown = summary["blocked_other_than_sum_ge_1_or_below_min"]
+    print(
+        "blocked_not_ge_1_or_below_min "
+        f"total={breakdown['total']} ended={breakdown['ended']} "
+        f"gap_frozen={breakdown['gap_frozen']} unanchored={breakdown['unanchored']} "
+        f"crossed={breakdown['crossed']} a_no_ask={breakdown['a_no_ask']} b_no_ask={breakdown['b_no_ask']}"
+    )
+    sell = summary["sell"]
+    print(
+        f"sell windows={sell['windows']} net={sell['net_usdc_one_shot_sum']} "
+        f"max_bid_sum={sell['max_bid_sum']} fee_killed_intervals={sell['fee_killed_intervals']} "
+        f"latency={sell['latency_survived_tape']}"
+    )
+    print(summary["neg_risk_complete_note"])
     print("unmodeled: " + ", ".join(UNMODELED))
     print(caveat)
     if not all_windows and fee_intervals == 0 and below_min_positive == 0:
@@ -460,6 +615,21 @@ def main() -> None:
         )
     else:
         print(f"Some windows survive latency on the tape-order book: {latency_survived}")
+    if sell["windows"] == 0 and sell["fee_killed_intervals"] == 0:
+        print(
+            "No executable touch had bid_yes + bid_no > 1. "
+            "Mint-and-sell never had a gross edge. Nothing survives on the sell side."
+        )
+    elif sell["windows"] == 0:
+        print("Mint-and-sell had gross edge and fees took all of it. Nothing survives fees.")
+    elif all(sell["latency_survived_tape"][str(latency)] == 0 for latency in LATENCIES_MS):
+        print(
+            f"{sell['windows']} sell windows are positive at latency 0. "
+            "None survive 100, 250, or 500 ms."
+        )
+    else:
+        print(f"Some sell windows survive latency: {sell['latency_survived_tape']}")
+    print("No complete neg-risk set was in this catalog. Those sums were not taken. Nothing survives there.")
 
 
 if __name__ == "__main__":

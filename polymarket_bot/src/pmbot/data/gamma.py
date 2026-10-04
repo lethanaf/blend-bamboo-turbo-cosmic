@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 import httpx
 
 from pmbot.config import Config
 from pmbot.data.models import ParsedMarket, parse_market
+from pmbot.data.universe import (
+    NegRiskEvent,
+    choose_complete_events,
+    parse_neg_risk_event,
+    select_across_categories,
+)
 from pmbot.httputil import get_text
 
 log = logging.getLogger(__name__)
@@ -66,3 +73,93 @@ async def discover_markets(
         offset += config.gamma_page_size
     log.info("selected %s/%s markets", len(chosen), target)
     return chosen
+
+
+async def _pages(
+    http: httpx.AsyncClient,
+    config: Config,
+    path: str,
+) -> list[dict]:
+    rows: list[dict] = []
+    offset = 0
+    for page in range(config.gamma_max_pages):
+        response = await get_text(
+            http,
+            path,
+            params={
+                "closed": "false",
+                "active": "true",
+                "limit": str(config.gamma_page_size),
+                "offset": str(offset),
+                "order": config.market_order,
+                "ascending": "true" if config.market_order_ascending else "false",
+            },
+            attempts=config.http_attempts,
+        )
+        batch = response.json()
+        if not isinstance(batch, list):
+            raise RuntimeError(f"Gamma {path} returned {type(batch).__name__}, expected a list")
+        log.info("gamma %s page %s offset=%s rows=%s", path, page, offset, len(batch))
+        rows.extend(item for item in batch if isinstance(item, dict))
+        if len(batch) < config.gamma_page_size:
+            break
+        offset += config.gamma_page_size
+    return rows
+
+
+async def discover_diversified(
+    http: httpx.AsyncClient,
+    config: Config,
+    *,
+    now: datetime | None = None,
+) -> tuple[list[ParsedMarket], list[NegRiskEvent]]:
+    """24h universe: complete neg-risk events, then top volume across categories.
+
+    Markets whose endDate is inside `exclude_ending_within_s` are left out of
+    both pieces. A complete event that does not fit in `max_markets` is skipped
+    whole. Sibling markets of a chosen event are all included.
+    """
+    moment = now or datetime.now(timezone.utc)
+    event_rows = await _pages(http, config, "/events")
+    parsed_events = [event for row in event_rows if (event := parse_neg_risk_event(row)) is not None]
+    chosen_events = choose_complete_events(
+        parsed_events,
+        count=config.neg_risk_event_count,
+        max_markets=config.max_markets,
+        now=moment,
+        horizon_s=config.exclude_ending_within_s,
+    )
+    markets: list[ParsedMarket] = []
+    seen: set[str] = set()
+    for event in chosen_events:
+        for sibling in event.siblings:
+            if sibling.condition_id in seen:
+                continue
+            seen.add(sibling.condition_id)
+            markets.append(sibling.market)
+    market_rows = await _pages(http, config, "/markets")
+    pool: list[ParsedMarket] = []
+    for row in market_rows:
+        parsed = parse_market(row)
+        if parsed is None or parsed.condition_id in seen:
+            continue
+        pool.append(parsed)
+    rest = select_across_categories(
+        pool,
+        max_markets=config.max_markets - len(markets),
+        now=moment,
+        horizon_s=config.exclude_ending_within_s,
+        skip=seen,
+    )
+    for market in rest:
+        if market.condition_id in seen:
+            continue
+        seen.add(market.condition_id)
+        markets.append(market)
+    log.info(
+        "diversified markets=%s events=%s (complete candidates=%s)",
+        len(markets),
+        len(chosen_events),
+        sum(1 for event in parsed_events if event.complete),
+    )
+    return markets, chosen_events

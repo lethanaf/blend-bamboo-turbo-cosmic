@@ -46,6 +46,9 @@ class Config:
     log_level: str
     book_404_end_after: int = 3
     gamma_refresh_interval_s: float = 1800.0
+    universe: str = "volume"
+    exclude_ending_within_s: int = 21600
+    neg_risk_event_count: int = 4
 
     @property
     def sqlite_path(self) -> Path:
@@ -99,6 +102,10 @@ def load_config(path: Path) -> Config:
     if not data_dir.is_absolute():
         data_dir = root / data_dir
 
+    universe = str(raw.get("universe", "volume"))
+    if universe not in ("volume", "diversified"):
+        raise ConfigError("universe must be volume or diversified")
+
     return Config(
         live_trading=as_bool("live_trading", False),
         gamma_base=str(raw.get("gamma_base", GAMMA_BASE)).rstrip("/"),
@@ -126,4 +133,7 @@ def load_config(path: Path) -> Config:
         log_level=str(raw.get("log_level", "INFO")),
         book_404_end_after=as_int("book_404_end_after", 3, 1),
         gamma_refresh_interval_s=as_float("gamma_refresh_interval_s", 1800, 1),
+        universe=universe,
+        exclude_ending_within_s=as_int("exclude_ending_within_s", 21600, 0),
+        neg_risk_event_count=as_int("neg_risk_event_count", 4, 0),
     )

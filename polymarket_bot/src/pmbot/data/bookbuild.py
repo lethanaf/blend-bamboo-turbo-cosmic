@@ -91,6 +91,21 @@ def market_bucket(slug: str) -> str:
     return "other"
 
 
+def clock_id(record: dict) -> str | None:
+    """Separate writers even when they reuse connection_id 0.
+
+    New tapes carry `session_id` (one uuid per recorder process). Older tapes
+    do not, and stay keyed by connection_id.
+    """
+    session = record.get("session_id")
+    if isinstance(session, str) and session:
+        return "session:" + session
+    connection = record.get("connection_id")
+    if isinstance(connection, str) and connection:
+        return "conn:" + connection
+    return None
+
+
 class RecvClock:
     """Monotonicity of recv clocks inside one session.
 

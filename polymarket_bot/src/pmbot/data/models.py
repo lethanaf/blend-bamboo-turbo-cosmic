@@ -75,15 +75,19 @@ def _optional_float(value: object) -> float | None:
         return None
 
 
-def parse_market(raw: dict) -> ParsedMarket | None:
+def parse_market(raw: dict, *, require_active: bool = True) -> ParsedMarket | None:
     """Return a recordable market, or None.
 
-    Recordable means the payload says the market is open, the order book is
-    enabled, orders are accepted, and at least one CLOB token id is present.
+    Recordable means the order book is enabled, orders are accepted, the
+    market is not closed, and at least one CLOB token id is present.
+    `require_active` is the discovery default. Neg-risk siblings that Gamma
+    marks inactive but still accepting orders are parsed with it off.
     """
     if not isinstance(raw, dict):
         return None
-    if raw.get("closed") is True or raw.get("active") is not True:
+    if raw.get("closed") is True:
+        return None
+    if require_active and raw.get("active") is not True:
         return None
     if raw.get("enableOrderBook") is not True:
         return None
@@ -117,7 +121,7 @@ def parse_market(raw: dict) -> ParsedMarket | None:
         slug=str(raw.get("slug") or ""),
         question=str(raw.get("question") or ""),
         end_date=raw.get("endDate") if isinstance(raw.get("endDate"), str) else None,
-        active=True,
+        active=raw.get("active") is True,
         closed=False,
         enable_order_book=True,
         accepting_orders=True,

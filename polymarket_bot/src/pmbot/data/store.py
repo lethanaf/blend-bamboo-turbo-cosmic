@@ -9,6 +9,7 @@ from pathlib import Path
 from pmbot.clock import Clock
 from pmbot.data.jsonl_log import HourlyJsonl
 from pmbot.data.models import ParsedMarket
+from pmbot.data.universe import NegRiskEvent
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (
@@ -71,6 +72,20 @@ CREATE TABLE IF NOT EXISTS gaps (
     recv_wall TEXT NOT NULL,
     recv_monotonic_ns INTEGER NOT NULL,
     jsonl_path TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS neg_risk_events (
+    neg_risk_market_id TEXT PRIMARY KEY,
+    event_id TEXT,
+    event_slug TEXT,
+    title TEXT,
+    end_date TEXT,
+    outcome_count INTEGER NOT NULL,
+    augmented INTEGER NOT NULL,
+    complete INTEGER NOT NULL,
+    volume_24hr REAL,
+    sibling_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 """
 
@@ -184,6 +199,53 @@ class Store:
         self.db.execute(
             "UPDATE tokens SET fee_rate_raw=?, updated_at=? WHERE token_id=?",
             (json.dumps(fee_rate, separators=(",", ":")), self.clock.wall().isoformat(), token_id),
+        )
+        self.db.commit()
+
+    def upsert_neg_risk_event(self, event: NegRiskEvent) -> None:
+        siblings = [
+            {
+                "condition_id": sibling.condition_id,
+                "slug": sibling.slug,
+                "question": sibling.question,
+                "group_item_title": sibling.group_item_title,
+                "yes_token_id": sibling.yes_token_id,
+                "placeholder": sibling.placeholder,
+                "augmented": sibling.augmented,
+            }
+            for sibling in event.siblings
+        ]
+        self.db.execute(
+            """
+            INSERT INTO neg_risk_events (
+                neg_risk_market_id, event_id, event_slug, title, end_date,
+                outcome_count, augmented, complete, volume_24hr, sibling_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(neg_risk_market_id) DO UPDATE SET
+                event_id=excluded.event_id,
+                event_slug=excluded.event_slug,
+                title=excluded.title,
+                end_date=excluded.end_date,
+                outcome_count=excluded.outcome_count,
+                augmented=excluded.augmented,
+                complete=excluded.complete,
+                volume_24hr=excluded.volume_24hr,
+                sibling_json=excluded.sibling_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                event.neg_risk_market_id,
+                event.event_id,
+                event.slug,
+                event.title,
+                event.end_date,
+                event.outcome_count,
+                int(event.augmented),
+                int(event.complete),
+                event.volume_24hr,
+                json.dumps(siblings, separators=(",", ":")),
+                self.clock.wall().isoformat(),
+            ),
         )
         self.db.commit()
 

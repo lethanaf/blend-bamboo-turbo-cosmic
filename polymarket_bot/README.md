@@ -314,3 +314,41 @@ Not modeled, and not in the numbers above: gas, queue position, rejects, one leg
 `unmodeled: 31268 quote mismatches out of 1766236 checks are not adjusted for in this number`
 
 The dump is `data/replay/lockin_scan.json`. It does not replace `data/replay/soak_report.json`.
+
+## The 25,811 other decision times
+
+886,490 binary buy decisions. 856,177 had both asks, size at least 5, and `ask_yes + ask_no >= 1`. 4,502 were below the 5-share minimum, and none of those sums were under 1. The other **25,811** are neither. First failing leg only, A before B. Inside a leg the order is ended, then gap-frozen, then unanchored, then crossed, then a missing ask.
+
+| Reason | Count | Of which |
+|---|---:|---|
+| ended | 0 | |
+| gap_frozen | 35 | A 32, B 3 |
+| unanchored | 35 | A 5, B 30 |
+| crossed | 491 | A 491, B 0 |
+| a_no_ask | 14,542 | A had no ask; A was not ended, frozen, unanchored, or crossed |
+| b_no_ask | 10,708 | A was a live ask; B had no ask |
+| Total | 25,811 | |
+
+## session_id
+
+Every new tape record carries `session_id`, one uuid per writer process (`HourlyJsonl`). Two recorders that both use `connection_id` `0` no longer share a clock. Replay uses `session_id` when the record has one, and `connection_id` when it does not. The soak tape has no `session_id`, so the 64 backward steps between 15:22:30Z and 15:23:04Z are still one connection.
+
+## Mint and sell
+
+The other binary lock-in is mint one pair for 1 USDC and sell both bids. Gross per share is `bid_yes + bid_no - 1`, minus taker fees on both sells. Same size rule, same latencies, same one-shot windows.
+
+On the soak tape the highest bid sum, at any size, was **0.999**. No touch had `bid_yes + bid_no > 1`. Fee-killed intervals: 0. Windows: 0. Nothing survives 0, 100, 250, or 500 ms.
+
+## 24h universe
+
+`config.yaml` stays `universe: volume` (the soak selection). `config.24h.yaml` is `universe: diversified`:
+
+- top 24h volume, round-robin across `feeType` categories
+- drop a market whose `endDate` is within 6 hours, including one already past
+- plus up to 4 complete neg-risk events, highest event volume first
+
+A complete event is every sibling `GET /events` returned, each with an open book. The event is stored with `negRiskMarketID`, the sibling list, the outcome count, and a flag on augmented/placeholder outcomes (`negRiskOther` or a title of Other/Placeholder, and the event's `negRiskAugmented`). An event that does not fit in `max_markets` is skipped whole. It is not cut down to a subset. This file was not started; there is no 24h tape.
+
+The complete-set scan (`scan_outcome_set`) buys every YES ask and, separately, mints and sells every YES bid. It runs only when the catalog row says the sibling list is complete. This soak catalog has no sibling list. Those sums were not taken. **Nothing survives.**
+
+No orders. `live_trading` is false.

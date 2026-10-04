@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import uuid
 import zlib
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -81,10 +82,14 @@ class HourlyJsonl:
         self._last_flush_ns: int | None = None
         self.members_written = 0
         self.uncompressed_bytes = 0
+        # One id per writer process. Two recorders sharing a directory no longer
+        # look like one connection_id "0".
+        self.session_id = str(uuid.uuid4())
 
     def write(self, record: dict) -> Path:
         if "recv_wall" not in record or "recv_monotonic_ns" not in record:
             raise ValueError("stored messages require recv_wall and recv_monotonic_ns")
+        record.setdefault("session_id", self.session_id)
         path = self._path_for(self.clock.wall())
         if self._buf_path is not None and path != self._buf_path:
             self.flush()

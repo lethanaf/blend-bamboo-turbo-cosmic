@@ -48,6 +48,22 @@ def test_interval_flush_and_truncated_tail(tmp_path: Path) -> None:
     assert [row["kind"] for row in read_jsonl_gz(path)] == ["a", "b"]
 
 
+def test_each_writer_stamps_its_own_session_id(tmp_path: Path) -> None:
+    clock = JumpClock()
+    first = HourlyJsonl(tmp_path / "a", clock, flush_records=10, flush_interval_s=10_000)
+    second = HourlyJsonl(tmp_path / "b", clock, flush_records=10, flush_interval_s=10_000)
+    assert first.session_id != second.session_id
+    first.write(_record("one", clock))
+    second.write(_record("two", clock))
+    first.close()
+    second.close()
+    left = read_jsonl_gz(next((tmp_path / "a").rglob("*.jsonl.gz")))[0]
+    right = read_jsonl_gz(next((tmp_path / "b").rglob("*.jsonl.gz")))[0]
+    assert left["session_id"] == first.session_id
+    assert right["session_id"] == second.session_id
+    assert left["session_id"] != right["session_id"]
+
+
 def test_close_flushes_partial_buffer(tmp_path: Path) -> None:
     clock = JumpClock()
     tape = HourlyJsonl(tmp_path, clock, flush_records=500, flush_interval_s=10_000)

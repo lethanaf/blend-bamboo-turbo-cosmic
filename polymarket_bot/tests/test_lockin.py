@@ -1,8 +1,15 @@
 from decimal import Decimal
 
-from pmbot.data.bookbuild import BookReplay, iso_to_ns, market_bucket, ns_to_iso
+from pmbot.data.bookbuild import BookReplay, RecvClock, clock_id, iso_to_ns, market_bucket, ns_to_iso
 from pmbot.data.fill import caveat_from_report, fee_per_match_vs_per_order, taker_fill
-from pmbot.data.lockin import binary_edge, neg_risk_group_report, return_per_day, scan_binary_pair
+from pmbot.data.lockin import (
+    binary_edge,
+    neg_risk_group_report,
+    return_per_day,
+    scan_binary_pair,
+    scan_outcome_set,
+    set_edge,
+)
 
 
 SCHEDULE = {"rate": "0.04", "exponent": 1, "takerOnly": True, "rebateRate": "0.25"}
@@ -215,6 +222,118 @@ def test_neg_risk_group_without_an_outcome_count_is_not_a_lockin() -> None:
     assert report["complete"] is False
     assert report["counted_as_lockin"] is False
     assert report["conditions"] == 2
+    complete = neg_risk_group_report(
+        [
+            {"condition_id": "a", "slug": "a", "question": "A"},
+            {"condition_id": "b", "slug": "b", "question": "B"},
+        ],
+        outcome_count=2,
+        sibling_condition_ids=["a", "b"],
+    )
+    assert complete["complete"] is True
+    assert complete["counted_as_lockin"] is True
+
+
+def test_session_id_splits_writers_that_share_connection_0() -> None:
+    clock = RecvClock()
+    left = clock_id({"session_id": "writer-a", "connection_id": "0"})
+    right = clock_id({"session_id": "writer-b", "connection_id": "0"})
+    assert left != right
+    clock.session_start(left)
+    clock.observe(left, "2026-10-03T15:22:31+00:00", 20)
+    clock.session_start(right)
+    clock.observe(right, "2026-10-03T15:22:30+00:00", 1)
+    assert clock.wall_backward == 0
+    assert clock_id({"connection_id": "0"}) == "conn:0"
+
+
+def test_mint_and_sell_uses_the_same_fee_and_dies_at_latency() -> None:
+    # Bids 0.60 and 0.60. Gross = 10 * 0.20. Fee per leg = 10 * 0.04 * 0.60 * 0.40.
+    edge = binary_edge(
+        Decimal("0.60"),
+        Decimal("10"),
+        Decimal("0.60"),
+        Decimal("12"),
+        SCHEDULE,
+        fees_enabled=True,
+        min_size=Decimal("5"),
+        side="sell",
+    )
+    assert edge is not None and edge["executable"] is True
+    assert edge["gross"] == Decimal("2.0")
+    assert edge["fees"] == Decimal("0.19200")
+    assert edge["net"] == Decimal("2.0") - Decimal("0.19200")
+    assert edge["cost"] == Decimal("10") + Decimal("0.19200")
+    replay = BookReplay()
+    t0 = "2026-10-03T14:00:00+00:00"
+    t1 = "2026-10-03T14:00:00.100000+00:00"
+    replay.replace(
+        1, "a", 1, [{"price": "0.60", "size": "10"}], [{"price": "0.70", "size": "10"}], kind="book", recv_wall=t0
+    )
+    replay.replace(
+        2, "b", 1, [{"price": "0.60", "size": "12"}], [{"price": "0.70", "size": "10"}], kind="book", recv_wall=t0
+    )
+    replay.price_change(3, "b", 2, "BUY", "0.60", "0", None, None, recv_wall=t1)
+    replay.price_change(4, "b", 2, "BUY", "0.20", "12", None, None, recv_wall=t1)
+    scanned = scan_binary_pair(
+        replay,
+        "a",
+        "b",
+        fee_schedule=SCHEDULE,
+        fees_enabled=True,
+        min_size=Decimal("5"),
+        end_ns=iso_to_ns("2026-10-04T14:00:00+00:00"),
+        side="sell",
+    )
+    assert len(scanned["windows"]) == 1
+    assert scanned["windows"][0]["net"] == Decimal("2.0") - Decimal("0.19200")
+    assert scanned["windows"][0]["duration_ns"] == 100_000_000
+    assert scanned["windows"][0]["latency"]["100"]["survived"] is False
+    assert scanned["max_bid_sum"] == Decimal("1.20")
+
+
+def test_three_outcome_yes_sum_pays_one_after_fees() -> None:
+    # Asks 0.30 three times. Gross = 10 * 0.10. Fee per leg = 10 * 0.04 * 0.30 * 0.70.
+    edge = set_edge(
+        [(Decimal("0.30"), Decimal("10"))] * 3,
+        SCHEDULE,
+        fees_enabled=True,
+        min_size=Decimal("5"),
+        side="buy",
+    )
+    assert edge is not None and edge["net"] == Decimal("1") - Decimal("0.25200")
+    sold = set_edge(
+        [(Decimal("0.40"), Decimal("10"))] * 3,
+        SCHEDULE,
+        fees_enabled=True,
+        min_size=Decimal("5"),
+        side="sell",
+    )
+    assert sold is not None and sold["gross"] == Decimal("2")
+    assert sold["fees"] == Decimal("0.28800")
+    replay = BookReplay()
+    wall = "2026-10-03T14:00:00+00:00"
+    for index, token in enumerate(("a", "b", "c")):
+        replay.replace(
+            index,
+            token,
+            1,
+            [{"price": "0.20", "size": "10"}],
+            [{"price": "0.30", "size": "10"}],
+            kind="book",
+            recv_wall=wall,
+        )
+    scanned = scan_outcome_set(
+        replay,
+        ["a", "b", "c"],
+        fee_schedule=SCHEDULE,
+        fees_enabled=True,
+        min_size=Decimal("5"),
+        end_ns=None,
+        side="buy",
+    )
+    assert len(scanned["windows"]) == 1
+    assert scanned["windows"][0]["net"] == Decimal("1") - Decimal("0.25200")
 
 
 def test_lockin_window_is_one_shot_and_dies_when_latency_sees_the_next_book() -> None:
