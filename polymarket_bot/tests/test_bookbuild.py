@@ -1,13 +1,30 @@
-from pmbot.data.bookbuild import BookReplay, apply_level
+from decimal import Decimal
+
+from pmbot.data.bookbuild import BookReplay, Side, is_duplicate_ws
 
 
 def test_size_zero_deletes_and_absolute_size_replaces() -> None:
-    book: dict[str, str] = {}
-    apply_level(book, "0.40", "5")
-    apply_level(book, "0.40", "9")
-    assert book == {"0.40": "9"}
-    apply_level(book, "0.400", "0")
-    assert book == {}
+    side = Side(high=True)
+    side.apply("0.40", "5")
+    side.apply("0.40", "9")
+    assert side.levels[Decimal("0.40")][0] == Decimal("9")
+    side.apply("0.400", "0")
+    assert side.levels == {}
+
+
+def test_best_updates_without_a_scan_until_it_is_removed() -> None:
+    bids = Side(high=True)
+    bids.apply("0.10", "1")
+    bids.apply("0.40", "2")
+    bids.apply("0.30", "3")
+    assert bids.best_price_str == "0.40"
+    bids.apply("0.30", "8")
+    assert bids.best_price_str == "0.40"
+    assert bids.best_size_str == "2"
+    bids.apply("0.40", "0")
+    assert bids.best_price_str == "0.30"
+    assert bids.best_size_str == "8"
+    assert Decimal("0.10") in bids.levels
 
 
 def test_aligned_uses_exchange_ts_and_tape_order() -> None:
@@ -115,11 +132,62 @@ def test_empty_ask_sentinel_matches_and_real_one_matches() -> None:
 def test_ended_status_after_consecutive_404s() -> None:
     replay = BookReplay(end_after=2)
     replay.replace(1, "t", 1000, [{"price": "0.40", "size": "1"}], [{"price": "0.60", "size": "1"}], kind="book")
-    replay.rest(2, "t", None, "periodic", None, None, "HTTP 404 no book")
+    replay.rest(2, "t", None, "periodic", None, None, "HTTP 404 no book", recv_wall="2026-10-03T14:00:02+00:00")
     replay.price_change(3, "t", 1200, "BUY", "0.40", "1", "0.40", "0.60")
-    replay.rest(4, "t", None, "periodic", None, None, "HTTP 404 no book")
+    replay.rest(4, "t", None, "periodic", None, None, "HTTP 404 no book", recv_wall="2026-10-03T14:00:04+00:00")
     replay.price_change(5, "t", 1300, "BUY", "0.40", "2", "0.20", "0.60")
     report = replay.finish()
     assert report["quote_tape_order"]["by_book_status"]["live"]["checked"] == 1
     assert report["quote_tape_order"]["by_book_status"]["ended"]["checked"] == 1
     assert report["quote_tape_order"]["by_book_status"]["ended"]["mismatch"] == 1
+
+
+def test_aligned_miss_tie_is_within_5ms_and_divergence_is_not() -> None:
+    tie = BookReplay()
+    tie.set_gamma("t", "open", "tie market")
+    tie.replace(1, "t", 1000, [{"price": "0.40", "size": "5"}], [{"price": "0.60", "size": "5"}], kind="book")
+    tie.price_change(2, "t", 3000, "BUY", "0.40", "9", None, None)
+    tie.rest(
+        3,
+        "t",
+        3000,
+        "periodic",
+        [{"price": "0.40", "size": "5"}],
+        [{"price": "0.60", "size": "5"}],
+        None,
+    )
+    tie_report = tie.finish()
+    assert tie_report["aligned_level_misses"][0]["class"] == "tie"
+    assert tie_report["aligned_level_misses"][0]["delta_ms"] == 0
+    assert tie_report["aligned_level_misses"][0]["bids"]["size_diff"] == 1
+    assert tie_report["aligned_level_miss_levels"]["size_diff"] == 1
+    assert tie_report["aligned_level_miss_levels"]["extra"] == 0
+
+    diverged = BookReplay()
+    diverged.replace(1, "t", 1000, [{"price": "0.40", "size": "5"}], [{"price": "0.60", "size": "5"}], kind="book")
+    diverged.price_change(2, "t", 1100, "BUY", "0.41", "1", None, None)
+    diverged.rest(
+        3,
+        "t",
+        5000,
+        "periodic",
+        [{"price": "0.40", "size": "5"}],
+        [{"price": "0.60", "size": "5"}],
+        None,
+    )
+    diverged_report = diverged.finish()
+    miss = diverged_report["aligned_level_misses"][0]
+    assert miss["class"] == "divergence"
+    assert miss["delta_ms"] == 3900
+    assert miss["events_within_5ms"] == 0
+    assert miss["bids"]["extra"] == 1
+    assert miss["bids"]["missing"] == 0
+
+
+def test_duplicate_ws_window_is_inclusive_5s() -> None:
+    recent = {1: 1_000}
+    assert is_duplicate_ws(recent, 1, 1_000) is True
+    assert is_duplicate_ws(recent, 1, 1_000 + 5_000_000_000) is True
+    assert is_duplicate_ws(recent, 1, 1_000 + 5_000_000_001) is False
+    assert is_duplicate_ws(recent, 2, 1_000) is False
+    assert is_duplicate_ws(recent, 1, 999) is False

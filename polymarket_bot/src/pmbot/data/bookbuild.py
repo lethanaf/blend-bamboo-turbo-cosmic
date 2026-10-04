@@ -1,4 +1,4 @@
-"""Rebuild a book from the tape and score it. No fill simulator.
+"""Rebuild a book from the tape and score it. No strategy, no orders.
 
 `price_change` sizes are absolute. Size 0 deletes the level. Apply order is
 tape order. A periodic REST book is scored two ways:
@@ -9,23 +9,50 @@ tape order. A periodic REST book is scored two ways:
 
 Events later on the tape with an earlier server timestamp count for the
 aligned book. Events earlier on the tape with a later server timestamp do not.
+
+Books are keyed by normalized Decimal so "0.40" and "0.400" are one level.
+Best bid and best ask move incrementally: a full scan happens only when the
+current best price is deleted.
 """
 
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 
-BidAsk = dict[str, str]
-# book/anchor: (kind, index, ts, bids, asks) with bids/asks tuple[(price, size)]
-# px:          (kind, index, ts, side, price, size)
-# gap:         ("gap", index)
+# book/anchor: (kind, index, ts, bids, asks, recv_wall)
+# px:          (kind, index, ts, side, price, size, recv_wall)
+# gap:         ("gap", index, recv_wall)
 Mut = tuple
+
+# Identical raw WS payload, kept within this many nanoseconds, is a duplicate.
+# Compared with recv_monotonic_ns. Inclusive on both ends.
+DUPLICATE_WINDOW_NS = 5_000_000_000
+DUPLICATE_MAP_CAP = 200_000
+
+
+def is_duplicate_ws(
+    recent: dict[int, int],
+    digest: int,
+    mono: int,
+    *,
+    window_ns: int = DUPLICATE_WINDOW_NS,
+) -> bool:
+    """Whether `hash(raw)` was already kept inside the duplicate window.
+
+    `hash` is Python's per-process string hash, so this matches identical
+    payload text inside one replay process. It is not a stable cross-process
+    digest. The caller records the new stamp after this returns False, and
+    prunes `recent` back to `window_ns` once it grows past DUPLICATE_MAP_CAP.
+    """
+    previous = recent.get(digest)
+    return previous is not None and 0 <= mono - previous <= window_ns
 
 
 def _dec(value: object) -> Decimal | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         return Decimal(str(value))
@@ -33,28 +60,93 @@ def _dec(value: object) -> Decimal | None:
         return None
 
 
-def apply_level(levels: BidAsk, price: str, size: str) -> None:
-    """Set the absolute size at `price`. A zero size removes the level."""
-    amount = _dec(size)
-    if amount is None:
-        return
-    if amount == 0:
-        levels.pop(str(price), None)
-        # Also drop a key that is the same number with different spelling.
-        target = _dec(price)
-        if target is None:
+def iso_to_ns(value: str) -> int:
+    """UTC nanoseconds from an ISO-8601 timestamp. Exact to microseconds."""
+    moment = datetime.fromisoformat(value)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    delta = moment.astimezone(timezone.utc) - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return delta.days * 86_400 * 1_000_000_000 + delta.seconds * 1_000_000_000 + delta.microseconds * 1000
+
+
+class Side:
+    """One side of a book, keyed by normalized Decimal, with an incremental best."""
+
+    __slots__ = ("levels", "best", "best_size", "best_price_str", "best_size_str", "high")
+
+    def __init__(self, *, high: bool) -> None:
+        self.levels: dict[Decimal, tuple[Decimal, str, str]] = {}
+        self.best: Decimal | None = None
+        self.best_size: Decimal | None = None
+        self.best_price_str: str | None = None
+        self.best_size_str: str | None = None
+        self.high = high
+
+    def clear(self) -> None:
+        self.levels.clear()
+        self.best = None
+        self.best_size = None
+        self.best_price_str = None
+        self.best_size_str = None
+
+    def apply(self, price: str, size: str) -> None:
+        """Absolute size. Zero deletes the level. Best is recomputed only if it was removed."""
+        numeric = _dec(price)
+        amount = _dec(size)
+        if numeric is None or amount is None:
             return
-        for key in list(levels):
-            if _dec(key) == target:
-                levels.pop(key, None)
-        return
-    target = _dec(price)
-    if target is None:
-        return
-    for key in list(levels):
-        if _dec(key) == target:
-            levels.pop(key, None)
-    levels[str(price)] = str(size)
+        if amount == 0:
+            if numeric not in self.levels:
+                return
+            del self.levels[numeric]
+            if self.best == numeric:
+                self._recompute_best()
+            return
+        self.levels[numeric] = (amount, str(price), str(size))
+        if self.best is None or (self.high and numeric > self.best) or (not self.high and numeric < self.best):
+            self.best = numeric
+            self.best_size = amount
+            self.best_price_str = str(price)
+            self.best_size_str = str(size)
+        elif self.best == numeric:
+            self.best_size = amount
+            self.best_price_str = str(price)
+            self.best_size_str = str(size)
+
+    def _recompute_best(self) -> None:
+        if not self.levels:
+            self.best = None
+            self.best_size = None
+            self.best_price_str = None
+            self.best_size_str = None
+            return
+        numeric = max(self.levels) if self.high else min(self.levels)
+        amount, price_str, size_str = self.levels[numeric]
+        self.best = numeric
+        self.best_size = amount
+        self.best_price_str = price_str
+        self.best_size_str = size_str
+
+    def load(self, levels: tuple[tuple[str, str], ...]) -> None:
+        self.clear()
+        for price, size in levels:
+            self.apply(price, size)
+
+    def copy(self) -> Side:
+        other = Side(high=self.high)
+        other.levels = dict(self.levels)
+        other.best = self.best
+        other.best_size = self.best_size
+        other.best_price_str = self.best_price_str
+        other.best_size_str = self.best_size_str
+        return other
+
+    def __len__(self) -> int:
+        return len(self.levels)
+
+
+def apply_level(levels: Side, price: str, size: str) -> None:
+    levels.apply(price, size)
 
 
 def levels_of(raw: object) -> tuple[tuple[str, str], ...]:
@@ -69,27 +161,10 @@ def levels_of(raw: object) -> tuple[tuple[str, str], ...]:
     return tuple(out)
 
 
-def _load(levels: tuple[tuple[str, str], ...]) -> BidAsk:
-    book: BidAsk = {}
-    for price, size in levels:
-        apply_level(book, price, size)
-    return book
-
-
-def _best(levels: BidAsk, *, high: bool) -> tuple[Decimal | None, str | None, str | None]:
-    chosen_d: Decimal | None = None
-    chosen_p: str | None = None
-    chosen_s: str | None = None
-    for price, size in levels.items():
-        amount = _dec(size)
-        if amount is None or amount == 0:
-            continue
-        numeric = _dec(price)
-        if numeric is None:
-            continue
-        if chosen_d is None or (high and numeric > chosen_d) or (not high and numeric < chosen_d):
-            chosen_d, chosen_p, chosen_s = numeric, price, size
-    return chosen_d, chosen_p, chosen_s
+def _load(levels: tuple[tuple[str, str], ...], *, high: bool) -> Side:
+    side = Side(high=high)
+    side.load(levels)
+    return side
 
 
 def _side_class(local: Decimal | None, quoted: str | None, *, sentinel: str) -> str:
@@ -109,11 +184,9 @@ def _side_class(local: Decimal | None, quoted: str | None, *, sentinel: str) -> 
     return "mismatch"
 
 
-def quote_verdict(bids: BidAsk, asks: BidAsk, best_bid: str | None, best_ask: str | None) -> dict:
-    bid_d, bid_p, bid_s = _best(bids, high=True)
-    ask_d, ask_p, ask_s = _best(asks, high=False)
-    bid_class = _side_class(bid_d, best_bid, sentinel="0")
-    ask_class = _side_class(ask_d, best_ask, sentinel="1")
+def quote_verdict(bids: Side, asks: Side, best_bid: str | None, best_ask: str | None) -> dict:
+    bid_class = _side_class(bids.best, best_bid, sentinel="0")
+    ask_class = _side_class(asks.best, best_ask, sentinel="1")
     parts = [item for item in (bid_class, ask_class) if item != "skip"]
     if not parts:
         verdict = "skip"
@@ -125,17 +198,16 @@ def quote_verdict(bids: BidAsk, asks: BidAsk, best_bid: str | None, best_ask: st
         "verdict": verdict,
         "bid_class": bid_class,
         "ask_class": ask_class,
-        "local_bid": bid_p,
-        "local_ask": ask_p,
-        "local_bid_size": bid_s,
-        "local_ask_size": ask_s,
-        "crossed": bid_d is not None and ask_d is not None and bid_d >= ask_d,
+        "local_bid": bids.best_price_str,
+        "local_ask": asks.best_price_str,
+        "local_bid_size": bids.best_size_str,
+        "local_ask_size": asks.best_size_str,
+        "crossed": bids.best is not None and asks.best is not None and bids.best >= asks.best,
     }
 
 
-def levels_diff(local: BidAsk, remote: tuple[tuple[str, str], ...]) -> dict[str, int]:
-    got = {_dec(price): _dec(size) for price, size in local.items()}
-    got = {price: size for price, size in got.items() if price is not None and size not in (None, 0)}
+def levels_diff(local: Side, remote: tuple[tuple[str, str], ...]) -> dict[str, int]:
+    got = {price: size for price, (size, _price_str, _size_str) in local.levels.items() if size != 0}
     want: dict[Decimal, Decimal] = {}
     for price, size in remote:
         numeric = _dec(price)
@@ -194,6 +266,74 @@ class _Rate:
         }
 
 
+_TO_END_BINS: tuple[tuple[float, float, str], ...] = (
+    (0, 30, "0-30s"),
+    (30, 60, "30-60s"),
+    (60, 120, "1-2min"),
+    (120, 300, "2-5min"),
+    (300, 600, "5-10min"),
+    (600, 1800, "10-30min"),
+    (1800, 3600, "30-60min"),
+    (3600, 7200, "60-120min"),
+    (7200, 1e18, ">120min"),
+)
+
+_SINCE_START_BINS: tuple[tuple[float, float, str], ...] = (
+    (0, 3, "0-3s"),
+    (3, 30, "3-30s"),
+    (30, 60, "30-60s"),
+    (60, 300, "1-5min"),
+    (300, 1800, "5-30min"),
+    (1800, 3600, "30-60min"),
+    (3600, 7200, "60-120min"),
+    (7200, 1e18, ">120min"),
+)
+
+
+def _percentile(sorted_values: list[float], fraction: float) -> float | None:
+    if not sorted_values:
+        return None
+    index = min(len(sorted_values) - 1, max(0, int(round((len(sorted_values) - 1) * fraction))))
+    return sorted_values[index]
+
+
+def _histogram(values: list[float], edges: tuple[tuple[float, float, str], ...]) -> dict:
+    counts = {label: 0 for _lo, _hi, label in edges}
+    negative = 0
+    other = 0
+    for value in values:
+        if value < 0:
+            negative += 1
+            continue
+        placed = False
+        for lo, hi, label in edges:
+            if lo <= value < hi:
+                counts[label] += 1
+                placed = True
+                break
+        if not placed:
+            other += 1
+    ordered = sorted(values)
+    within = {
+        "60s": sum(1 for value in values if 0 <= value <= 60),
+        "120s": sum(1 for value in values if 0 <= value <= 120),
+        "300s": sum(1 for value in values if 0 <= value <= 300),
+        "600s": sum(1 for value in values if 0 <= value <= 600),
+    }
+    return {
+        "n": len(values),
+        "negative_or_after": negative,
+        "bins": counts,
+        "other": other,
+        "within": within,
+        "p50_s": _percentile(ordered, 0.50),
+        "p90_s": _percentile(ordered, 0.90),
+        "p99_s": _percentile(ordered, 0.99),
+        "min_s": None if not ordered else ordered[0],
+        "max_s": None if not ordered else ordered[-1],
+    }
+
+
 class BookReplay:
     def __init__(self, *, end_after: int = 3, quiet_ms: int = 1000, mismatch_limit: int = 20) -> None:
         if end_after < 1:
@@ -202,15 +342,21 @@ class BookReplay:
         self.quiet_ms = quiet_ms
         self.mismatch_limit = mismatch_limit
         self.muts: dict[str, list[Mut]] = defaultdict(list)
-        self.live_bids: dict[str, BidAsk] = defaultdict(dict)
-        self.live_asks: dict[str, BidAsk] = defaultdict(dict)
+        self.live_bids: dict[str, Side] = {}
+        self.live_asks: dict[str, Side] = {}
         self.anchored: set[str] = set()
+        self.gap_frozen: set[str] = set()
         self.fail_streak: dict[str, int] = defaultdict(int)
         self.ended_at: dict[str, int] = {}
+        self.ended_recv_wall: dict[str, str] = {}
+        self.resolved_recv_wall: dict[str, str] = {}
+        self.resolved_server_ts: dict[str, int] = {}
+        self.session_start_wall: str | None = None
         self.ws_ts: dict[str, list[int]] = defaultdict(list)
         self.precede: dict[str, deque] = defaultdict(lambda: deque(maxlen=8))
         self.snapshots: list[dict] = []
         self.quote_rows: list[tuple] = []
+        self.resolved_quote_walls: list[tuple[str, str]] = []
         self.gamma: dict[str, str] = {}
         self.questions: dict[str, str] = {}
         self.crossed = 0
@@ -227,6 +373,7 @@ class BookReplay:
         self.top_aligned_quiet = _Rate()
         self.top_unaligned_quiet = _Rate()
         self.mismatches: list[dict] = []
+        self.aligned_misses: list[dict] = []
         self.skipped_unanchored_px = 0
         self.quote_checked_unanchored = 0
 
@@ -240,29 +387,64 @@ class BookReplay:
             return
         self.ws_ts[token].append(ts)
 
-    def gap(self, index: int, token_ids: list[str]) -> None:
+    def note_session_start(self, recv_wall: str, is_reconnect: bool) -> None:
+        if self.session_start_wall is None and recv_wall:
+            self.session_start_wall = recv_wall
+
+    def note_market_resolved(self, token: str, server_ts: int | None, recv_wall: str | None) -> None:
+        if recv_wall and token not in self.resolved_recv_wall:
+            self.resolved_recv_wall[token] = recv_wall
+        if server_ts is not None and token not in self.resolved_server_ts:
+            self.resolved_server_ts[token] = server_ts
+
+    def _sides(self, token: str) -> tuple[Side, Side]:
+        bids = self.live_bids.get(token)
+        asks = self.live_asks.get(token)
+        if bids is None or asks is None:
+            bids = Side(high=True)
+            asks = Side(high=False)
+            self.live_bids[token] = bids
+            self.live_asks[token] = asks
+        return bids, asks
+
+    def gap(self, index: int, token_ids: list[str], recv_wall: str | None = None) -> None:
         for token in token_ids:
-            self.muts[token].append(("gap", index))
-            self.live_bids[token].clear()
-            self.live_asks[token].clear()
+            self.muts[token].append(("gap", index, recv_wall))
+            bids, asks = self._sides(token)
+            bids.clear()
+            asks.clear()
             self.anchored.discard(token)
+            self.gap_frozen.add(token)
             self.precede[token].append({"kind": "gap", "index": index})
 
-    def replace(self, index: int, token: str, ts: int | None, bids: object, asks: object, *, kind: str) -> None:
+    def replace(
+        self,
+        index: int,
+        token: str,
+        ts: int | None,
+        bids: object,
+        asks: object,
+        *,
+        kind: str,
+        recv_wall: str | None = None,
+    ) -> None:
         bid_levels = levels_of(bids)
         ask_levels = levels_of(asks)
-        self.muts[token].append((kind, index, ts, bid_levels, ask_levels))
-        self.live_bids[token] = _load(bid_levels)
-        self.live_asks[token] = _load(ask_levels)
+        self.muts[token].append((kind, index, ts, bid_levels, ask_levels, recv_wall))
+        live_bids = _load(bid_levels, high=True)
+        live_asks = _load(ask_levels, high=False)
+        self.live_bids[token] = live_bids
+        self.live_asks[token] = live_asks
         self.anchored.add(token)
+        self.gap_frozen.discard(token)
         self.fail_streak[token] = 0
         self.precede[token].append(
             {
                 "kind": kind,
                 "index": index,
                 "ts": ts,
-                "bids": len(self.live_bids[token]),
-                "asks": len(self.live_asks[token]),
+                "bids": len(live_bids),
+                "asks": len(live_asks),
             }
         )
         self._count_crossed(token)
@@ -281,13 +463,14 @@ class BookReplay:
         recv_wall: str | None = None,
     ) -> None:
         self.note_ws(token, ts)
-        self.muts[token].append(("px", index, ts, side, str(price), str(size)))
+        self.muts[token].append(("px", index, ts, side, str(price), str(size), recv_wall))
         if token not in self.anchored:
             self.skipped_unanchored_px += 1
         else:
-            target = self.live_bids[token] if side == "BUY" else self.live_asks[token]
+            bids, asks = self._sides(token)
+            target = bids if side == "BUY" else asks
             if side in ("BUY", "SELL"):
-                apply_level(target, str(price), str(size))
+                target.apply(str(price), str(size))
             self._count_crossed(token)
         self.precede[token].append(
             {"kind": "px", "index": index, "ts": ts, "side": side, "price": str(price), "size": str(size)}
@@ -321,16 +504,19 @@ class BookReplay:
         bids: object,
         asks: object,
         error: str | None,
+        recv_wall: str | None = None,
     ) -> None:
         if error:
             if "404" in error:
                 self.fail_streak[token] += 1
                 if self.fail_streak[token] >= self.end_after and token not in self.ended_at:
                     self.ended_at[token] = index
+                    if recv_wall:
+                        self.ended_recv_wall[token] = recv_wall
             return
         self.fail_streak[token] = 0
         if reason in ("bootstrap", "reconnect"):
-            self.replace(index, token, ts, bids, asks, kind="anchor")
+            self.replace(index, token, ts, bids, asks, kind="anchor", recv_wall=recv_wall)
             return
         if reason != "periodic":
             return
@@ -372,9 +558,12 @@ class BookReplay:
     def finish(self) -> dict:
         for token, stamps in self.ws_ts.items():
             stamps.sort()
+        miss_diff = {"extra": 0, "missing": 0, "size_diff": 0}
         for snap in self.snapshots:
             token = snap["token"]
-            anchored, bids, asks = self._replay(token, aligned=True, cutoff_index=snap["index"], cutoff_ts=snap["ts"])
+            anchored, bids, asks, last_ts, within_5ms = self._replay(
+                token, aligned=True, cutoff_index=snap["index"], cutoff_ts=snap["ts"]
+            )
             if not anchored or snap["ts"] is None:
                 continue
             diff_b = levels_diff(bids, snap["bids"])
@@ -398,6 +587,25 @@ class BookReplay:
                 self.top_unaligned_quiet.add(
                     token, snap["book_status"], snap["gamma_status"], bool(snap["unaligned_top_mismatch"])
                 )
+            if not exact:
+                for key in ("extra", "missing", "size_diff"):
+                    miss_diff[key] += diff_b[key] + diff_a[key]
+                delta = None if last_ts is None else snap["ts"] - last_ts
+                tie = delta is not None and 0 <= delta <= 5
+                self.aligned_misses.append(
+                    {
+                        "token": token,
+                        "question": self.questions.get(token, ""),
+                        "gamma_status": snap["gamma_status"],
+                        "snapshot_ts": snap["ts"],
+                        "last_applied_ts": last_ts,
+                        "delta_ms": delta,
+                        "events_within_5ms": within_5ms,
+                        "class": "tie" if tie else "divergence",
+                        "bids": diff_b,
+                        "asks": diff_a,
+                    }
+                )
         for token, ts, book_status, gamma_status, mismatch in self.quote_rows:
             if self._quiet(token, ts, ignore_one=ts):
                 self.quote_quiet.add(token, book_status, gamma_status, mismatch)
@@ -420,6 +628,108 @@ class BookReplay:
             "quote_checked_unanchored": self.quote_checked_unanchored,
             "first_quote_mismatches": self.mismatches,
             "periodic_snapshots_seen": len(self.snapshots),
+            "aligned_level_misses": self.aligned_misses,
+            "aligned_level_miss_levels": miss_diff,
+            "resolved_quote_histogram": self._resolved_histogram(),
+        }
+
+    def book_asof(self, token: str, recv_wall: str) -> dict:
+        """Tape-order book using events whose recv_wall is <= `recv_wall`.
+
+        A gap clears and freezes the token until the next anchor. Ended is the
+        recv time of the record that tripped `end_after` consecutive 404s.
+        """
+        asof = iso_to_ns(recv_wall)
+        bids = Side(high=True)
+        asks = Side(high=False)
+        anchored = False
+        gap_frozen = False
+        for mut in self.muts[token]:
+            wall = mut[-1]
+            if not isinstance(wall, str):
+                raise ValueError(f"token {token} event has no recv_wall; cannot apply latency")
+            if iso_to_ns(wall) > asof:
+                continue
+            kind = mut[0]
+            if kind == "gap":
+                bids.clear()
+                asks.clear()
+                anchored = False
+                gap_frozen = True
+                continue
+            if kind == "px":
+                if not anchored:
+                    continue
+                side, price, size = mut[3], mut[4], mut[5]
+                if side == "BUY":
+                    bids.apply(price, size)
+                elif side == "SELL":
+                    asks.apply(price, size)
+                continue
+            bids = _load(mut[3], high=True)
+            asks = _load(mut[4], high=False)
+            anchored = True
+            gap_frozen = False
+        ended_wall = self.ended_recv_wall.get(token)
+        ended = ended_wall is not None and iso_to_ns(ended_wall) <= asof
+        return {
+            "bids": bids,
+            "asks": asks,
+            "anchored": anchored,
+            "gap_frozen": gap_frozen,
+            "ended": ended,
+        }
+
+    def _resolved_histogram(self) -> dict:
+        to_ended: list[float] = []
+        to_resolved: list[float] = []
+        since_start: list[float] = []
+        no_ended = 0
+        no_resolved = 0
+        no_session = 0
+        missing_wall = 0
+        start = self.session_start_wall
+        start_ns = iso_to_ns(start) if start else None
+        ended_ns = {token: iso_to_ns(wall) for token, wall in self.ended_recv_wall.items()}
+        resolved_ns = {token: iso_to_ns(wall) for token, wall in self.resolved_recv_wall.items()}
+        for token, wall in self.resolved_quote_walls:
+            if not wall:
+                missing_wall += 1
+                continue
+            stamp = iso_to_ns(wall)
+            end = ended_ns.get(token)
+            if end is None:
+                no_ended += 1
+            else:
+                to_ended.append((end - stamp) / 1_000_000_000)
+            resolved = resolved_ns.get(token)
+            if resolved is None:
+                no_resolved += 1
+            else:
+                to_resolved.append((resolved - stamp) / 1_000_000_000)
+            if start_ns is None:
+                no_session += 1
+            else:
+                since_start.append((stamp - start_ns) / 1_000_000_000)
+        startup = sum(1 for value in since_start if 0 <= value < 3)
+        return {
+            "mismatches": len(self.resolved_quote_walls),
+            "missing_recv_wall": missing_wall,
+            "no_ended_index": no_ended,
+            "no_market_resolved_on_tape": no_resolved,
+            "no_session_start": no_session,
+            "startup_first_3s": startup,
+            "seconds_to_ended_index": _histogram(to_ended, _TO_END_BINS),
+            "seconds_to_market_resolved": _histogram(to_resolved, _TO_END_BINS),
+            "seconds_since_session_start": _histogram(since_start, _SINCE_START_BINS),
+            "note": (
+                "Population is quote mismatches whose Gamma status is resolved. "
+                "seconds_to_ended_index uses the recv time of the tape record that "
+                "tripped end_after consecutive GET /book 404s. "
+                "seconds_to_market_resolved uses the first market_resolved frame on the tape "
+                "that names the token. Tokens with neither endpoint are counted aside, not binned. "
+                "The first 20 quote mismatches in the dump are a startup transient and are not this histogram."
+            ),
         }
 
     def _score_quote(
@@ -435,7 +745,8 @@ class BookReplay:
         if token not in self.anchored:
             self.quote_checked_unanchored += 1
             return
-        view = quote_verdict(self.live_bids[token], self.live_asks[token], best_bid, best_ask)
+        bids, asks = self._sides(token)
+        view = quote_verdict(bids, asks, best_bid, best_ask)
         if view["verdict"] == "skip":
             return
         book_status = self._book_status(token, index)
@@ -443,6 +754,8 @@ class BookReplay:
         mismatch = view["verdict"] == "mismatch"
         self.quote.add(token, book_status, gamma_status, mismatch)
         self.quote_rows.append((token, ts, book_status, gamma_status, mismatch))
+        if mismatch and gamma_status == "resolved":
+            self.resolved_quote_walls.append((token, recv_wall or ""))
         if mismatch and len(self.mismatches) < self.mismatch_limit:
             self.mismatches.append(
                 {
@@ -466,8 +779,8 @@ class BookReplay:
             )
 
     def _count_crossed(self, token: str) -> None:
-        view = quote_verdict(self.live_bids[token], self.live_asks[token], None, None)
-        if view["crossed"]:
+        bids, asks = self._sides(token)
+        if bids.best is not None and asks.best is not None and bids.best >= asks.best:
             self.crossed += 1
             self.crossed_tokens.add(token)
 
@@ -491,17 +804,26 @@ class BookReplay:
         return count == 0
 
     def _replay(
-        self, token: str, *, aligned: bool, cutoff_index: int, cutoff_ts: int | None
-    ) -> tuple[bool, BidAsk, BidAsk]:
-        bids: BidAsk = {}
-        asks: BidAsk = {}
+        self,
+        token: str,
+        *,
+        aligned: bool,
+        cutoff_index: int,
+        cutoff_ts: int | None,
+    ) -> tuple[bool, Side, Side, int | None, int]:
+        bids = Side(high=True)
+        asks = Side(high=False)
         anchored = False
+        last_ts: int | None = None
+        within_5ms = 0
         for mut in self.muts[token]:
             kind = mut[0]
             index = mut[1]
             if kind == "gap":
                 if index < cutoff_index:
-                    bids, asks, anchored = {}, {}, False
+                    bids = Side(high=True)
+                    asks = Side(high=False)
+                    anchored = False
                 continue
             ts = mut[2]
             if aligned:
@@ -509,24 +831,30 @@ class BookReplay:
                     continue
             elif index >= cutoff_index:
                 break
+            if (
+                aligned
+                and ts is not None
+                and cutoff_ts is not None
+                and 0 <= cutoff_ts - ts <= 5
+            ):
+                within_5ms += 1
+            last_ts = ts if isinstance(ts, int) else last_ts
             if kind == "px":
                 if not anchored:
                     continue
                 side, price, size = mut[3], mut[4], mut[5]
                 if side == "BUY":
-                    apply_level(bids, price, size)
+                    bids.apply(price, size)
                 elif side == "SELL":
-                    apply_level(asks, price, size)
+                    asks.apply(price, size)
             else:
-                bids = _load(mut[3])
-                asks = _load(mut[4])
+                bids = _load(mut[3], high=True)
+                asks = _load(mut[4], high=False)
                 anchored = True
-        return anchored, bids, asks
+        return anchored, bids, asks, last_ts, within_5ms
 
 
 def _rest_top(bids: tuple[tuple[str, str], ...], asks: tuple[tuple[str, str], ...]) -> tuple[str | None, str | None]:
-    bid_book = _load(bids)
-    ask_book = _load(asks)
-    _bid_d, bid_p, _bid_s = _best(bid_book, high=True)
-    _ask_d, ask_p, _ask_s = _best(ask_book, high=False)
-    return bid_p, ask_p
+    bid_book = _load(bids, high=True)
+    ask_book = _load(asks, high=False)
+    return bid_book.best_price_str, ask_book.best_price_str

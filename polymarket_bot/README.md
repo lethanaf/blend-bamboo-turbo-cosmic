@@ -133,7 +133,7 @@ Gamma on 2026-10-04, `closed=true` (the default `/markets?slug=` list hides them
 
 ## Fee rules, read before any fill simulator
 
-2b is not built. From [Fees](https://docs.polymarket.com/trading/fees), not from `base_fee`:
+What was known before the fill function existed, from [Fees](https://docs.polymarket.com/trading/fees), not from `base_fee`:
 
 ```
 fee = C × feeRate × p × (1 - p)
@@ -144,3 +144,105 @@ Makers are not charged. Only takers pay. The published formula has no exponent; 
 The page's fee-precision paragraph: "Fees are rounded to 5 decimal places. The smallest fee charged is 0.00001 USDC. Anything smaller rounds to zero, so very small trades near the extremes may incur no fee at all." It does not say half-up versus half-even.
 
 [Maker rebates](https://docs.polymarket.com/market-makers/maker-rebates) uses the same formula and the same 5-decimal / 0.00001 minimum, but its sports taker rate is 0.03 while the fees page lists sports at 0.05. The catalog had both `sports_fees_v3` 0.05 and `sports_v2` 0.03. A fill simulator has to use that market's `feeSchedule`, not the category table. Geopolitics on the fees page is rate 0, which matches the two `fees_enabled=0` markets already in the catalog.
+
+## 2a follow-up, before any fill
+
+Same soak tape, same duplicate rule, same end-after 3. Scores did not move: aligned levels 8 / 1,090, unaligned levels 45 / 1,090, quotes 31,268 / 1,766,236, quiet quotes 0 / 11,388, crossed-after-apply 982, touch-at-snapshot 0. Gamma-resolved quotes are 30,976 / 1,669,358.
+
+### Resolved-market quote mismatches
+
+Population: the 30,976 quote mismatches on tokens Gamma called resolved on 2026-10-04. All 30,976 have a recv time. The dumped first 20 are all inside 3.1s of session start (18 in the first 3 seconds, two at 3.098s). That startup transient is not the distribution below.
+
+Seconds since the first `session_start` (`2026-10-03T14:28:07.893967+00:00`, `is_reconnect=false`):
+
+| Age | Mismatches |
+|---|---:|
+| 0–3s | 18 |
+| 3–30s | 158 |
+| 30–60s | 456 |
+| 1–5 min | 4,234 |
+| 5–30 min | 18,486 |
+| 30–60 min | 1,284 |
+| 60–120 min | 6,340 |
+
+Nearest-rank p50 is 974s, p90 is 6,447s, max is 7,192s. They run through the soak. They do not sit at startup.
+
+Seconds before the ended index (recv time of the `rest_book` that tripped the third consecutive 404). 9,106 mismatches have no ended index. The other 21,870:
+
+| Before the 404 | Mismatches |
+|---|---:|
+| 0–5 min | 0 |
+| 5–10 min | 174 |
+| 10–30 min | 1,794 |
+| 30–60 min | 11,310 |
+| 60–120 min | 8,592 |
+
+Minimum 572s, median 3,351s, maximum 4,785s. None are after the ended index. **They do not cluster in the final minutes before the book ends.** The closest is nine and a half minutes out.
+
+Seconds before the first `market_resolved` frame that names the token. The tape has 11 such frames and 20 tokens, and those 20 tokens are exactly the 20 that 404'd. The same 9,106 mismatches have no `market_resolved` on the tape (24 of the 44 Gamma-resolved tokens never got that frame during the soak). The other 21,870:
+
+| Before `market_resolved` | Mismatches |
+|---|---:|
+| 0–30s | 752 |
+| 30–60s | 1,216 |
+| 1–30 min | 0 |
+| 30–60 min | 17,758 |
+| 60–120 min | 2,144 |
+
+Minimum 0.3ms, median 2,664s. So 1,968 / 30,976 (6.4%) sit in the final minute before `market_resolved`, and then there is a hole until 30 minutes. That pocket is real and small. It is not "the 31k are the final window," and it is not the final window before the book 404.
+
+### The 8 aligned level misses
+
+Rule: a **tie** is a miss whose last applied event has server timestamp equal to the snapshot, or within 5ms before it (`0 <= snapshot_ts - last_ts <= 5`). Anything else is a **divergence**. Prices still compare as `Decimal`.
+
+All 8 are ties. All 8 have `delta_ms = 0` (the last applied server timestamp equals the snapshot timestamp). Seven have one event inside that 5ms; the GamerLegion token has five. There is no divergence.
+
+Level counts on those 8, summed across both sides: **extra 0, missing 0, size_diff 12**. The book has the same prices as the REST snapshot and different sizes. The touch still matched (aligned top mismatches stay 0).
+
+| Market | Gamma | Side that differs | Size diffs |
+|---|---|---|---:|
+| Lula Yes | open | ask | 3 |
+| Lula No | open | bid | 3 |
+| Fed unchanged Yes | open | ask | 1 |
+| Fed unchanged No | open | bid | 1 |
+| Iran No | open | bid | 1 |
+| Iran Yes | open | ask | 1 |
+| Putin Yes | open | ask | 1 |
+| GamerLegion (series) | resolved | ask | 1 |
+
+### Duplicate frames
+
+A websocket record is dropped when `hash(raw)` equals a frame already kept whose `recv_monotonic_ns` is between 0 and 5,000,000,000 ns earlier, inclusive. `hash` is Python's per-process string hash, so this is identical payload text inside one replay process, not a stable digest. After the map passes 200,000 entries it is pruned back to that same 5 second window. The soak dropped **722** under this rule. A second bootstrap `rest_book` for a token is a different counter (`ignored_extra_bootstrap`, 50) and is not one of the 722.
+
+### Replay speed
+
+One full soak replay, same machine, same checks (including the aligned rebuild of all 1,090 periodic books).
+
+| Book | Time |
+|---|---:|
+| Before: price strings, scan the side to find an equal `Decimal` and to recompute best bid/ask | 501.2s |
+| After: levels keyed by normalized `Decimal`; best bid/ask updated incrementally, rescanned only when that price is deleted | 100.1s |
+
+5.0×. The accepted mismatch counts above are from the after run and match the before run.
+
+## 2b taker fill
+
+`pmbot.data.fill.taker_fill` walks a book. It does not submit orders and it does not change `live_trading`. There is no strategy.
+
+Refused, and not a fill: crossed local book (`best bid >= best ask`), unanchored token, token frozen by a gap (cleared until the next anchor), ended token (the recv time of the record that tripped `end_after` 404s is `<=` the evaluation time). A walk that takes some but not all of the requested size is `partial`. The unfilled remainder is not a fill. An empty opposite side is `unfilled`, not a fill. Slippage is vwap minus touch on a buy, and touch minus vwap on a sell.
+
+The book is the tape-order book of events with `recv_wall <= decision recv time + latency` (`BookReplay.book_asof`). Latency is the caller's number.
+
+Fee, from the market's `feeSchedule`, not from `base_fee` and not from the category table:
+
+```
+fee = C × rate × p × (1 - p)
+```
+
+per walked level, then summed. `C` is the shares taken at that level and `p` is that level's price. Rounded to 5 decimal places, and a rounded result below 0.00001 is 0. `half-up` and `half-even` are both implemented; the Fees page does not say which. `rebateRate` is not credited. `fees_enabled` false (or 0) pays 0. A rate of 0 pays 0. `exponent != 1` raises `FeeError`, because [Market Details](https://docs.polymarket.com/market-data/market-details) says the exponent is applied to the price component and the published formula is only that curve at exponent 1. Every schedule in the soak catalog had exponent 1 (33 markets). The two `fees_enabled=0` markets have no schedule.
+
+Half-up versus half-even, same formula: 100 shares at 0.50 with rate 0.07 is 1.75000 either way (the crypto row of the fee table). They differ on an exact half at the 6th decimal: raw 0.000005 is 0.00001 half-up and 0 half-even; raw 0.000025 is 0.00003 half-up and 0.00002 half-even; raw 0.000015 is 0.00002 either way.
+
+Asset, read 2026-10-04. [Fees](https://docs.polymarket.com/trading/fees) says taker fees are calculated in **USDC** and does not name a different asset for buys and for sells. [Maker rebates](https://docs.polymarket.com/programs/maker-rebates) calls that same amount **pUSD** and pays rebates in pUSD, again with no buy/sell split. The older "collected in shares on buys, USDC on sells" sentence is not on either page (the old learn URLs redirect here). This fill charges the formula in USDC on both buys and sells and does not reduce the share count on a buy. The rebates page's sports taker rate is now 0.05, matching the fees page. The catalog still has one `sports_fees_v2` market at 0.03 and 21 `sports_fees_v3` at 0.05. A fill uses that market's `feeSchedule`.
+
+The final-window behaviour above is unmodeled. `TakerFill.lines()` prints this beside every number: of 30976 resolved-market quote mismatches, 18 are in the first 3s; 9106 have no ended index and no `market_resolved` on the tape; of 21870 with an ended index, none are in the final 5 min (minimum 572s before the 404, median 3351s); of those 21870, 1968 are in the final 60s before `market_resolved` and the rest are at least 30 min earlier.

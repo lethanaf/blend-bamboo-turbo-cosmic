@@ -12,8 +12,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from pmbot.data.bookbuild import BookReplay  # noqa: E402
+from pmbot.data.bookbuild import DUPLICATE_MAP_CAP, DUPLICATE_WINDOW_NS, BookReplay, is_duplicate_ws  # noqa: E402
 from pmbot.data.jsonl_log import iter_jsonl_gz  # noqa: E402
+from pmbot.data.scope import event_asset_ids  # noqa: E402
 
 
 def _ts(value: object) -> int | None:
@@ -48,6 +49,15 @@ def _load_gamma(path: Path, replay: BookReplay) -> None:
 
 
 def replay_dir(books: Path, replay: BookReplay) -> dict:
+    """Replay tape order.
+
+    Duplicate WS frames: drop a record when `is_duplicate_ws` is true for
+    `hash(raw)` and `recv_monotonic_ns`. The window is 5 seconds, inclusive.
+    The hash map is pruned to that window after 200_000 entries. This is the
+    rule that removed 722 frames from the soak (the stray second writer).
+    A second bootstrap `rest_book` for a token is ignored separately and is
+    not part of that count.
+    """
     index = 0
     recent: dict[int, int] = {}
     dropped_dupes = 0
@@ -59,21 +69,24 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
         for record in iter_jsonl_gz(path):
             index += 1
             kind = record.get("kind")
+            wall = record.get("recv_wall")
+            wall_s = wall if isinstance(wall, str) else None
+            if kind == "session_start":
+                replay.note_session_start(wall_s or "", bool(record.get("is_reconnect")))
+                continue
             if kind == "ws":
                 raw = record.get("raw")
                 if not isinstance(raw, str):
                     continue
                 mono = int(record.get("recv_monotonic_ns") or 0)
                 digest = hash(raw)
-                previous = recent.get(digest)
-                if previous is not None and 0 <= mono - previous <= 5_000_000_000:
+                if is_duplicate_ws(recent, digest, mono):
                     dropped_dupes += 1
                     continue
                 recent[digest] = mono
-                if len(recent) > 200_000:
-                    cutoff = mono - 5_000_000_000
+                if len(recent) > DUPLICATE_MAP_CAP:
+                    cutoff = mono - DUPLICATE_WINDOW_NS
                     recent = {key: stamp for key, stamp in recent.items() if stamp >= cutoff}
-                wall = record.get("recv_wall")
                 for event in _events(raw):
                     event_type = event.get("event_type")
                     ts = _ts(event.get("timestamp"))
@@ -82,12 +95,16 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
                         if not token:
                             continue
                         replay.note_ws(token, ts)
-                        replay.replace(index, token, ts, event.get("bids"), event.get("asks"), kind="book")
+                        replay.replace(
+                            index, token, ts, event.get("bids"), event.get("asks"), kind="book", recv_wall=wall_s
+                        )
                     elif event_type == "price_change":
                         changes = event.get("price_changes")
                         if not isinstance(changes, list):
                             continue
-                        per_token = Counter(str(change.get("asset_id") or "") for change in changes if isinstance(change, dict))
+                        per_token = Counter(
+                            str(change.get("asset_id") or "") for change in changes if isinstance(change, dict)
+                        )
                         multi_entry_tokens += sum(1 for count in per_token.values() if count > 1)
                         frame_ts = ts
                         for change in changes:
@@ -106,7 +123,7 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
                                 str(change.get("size") or "0"),
                                 None if change.get("best_bid") is None else str(change.get("best_bid")),
                                 None if change.get("best_ask") is None else str(change.get("best_ask")),
-                                recv_wall=wall if isinstance(wall, str) else None,
+                                recv_wall=wall_s,
                             )
                     elif event_type == "best_bid_ask":
                         token = str(event.get("asset_id") or "")
@@ -118,15 +135,18 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
                             ts,
                             None if event.get("best_bid") is None else str(event.get("best_bid")),
                             None if event.get("best_ask") is None else str(event.get("best_ask")),
-                            recv_wall=wall if isinstance(wall, str) else None,
+                            recv_wall=wall_s,
                         )
+                    elif event_type == "market_resolved":
+                        for token in event_asset_ids(event):
+                            replay.note_market_resolved(token, ts, wall_s)
                     elif event_type in ("last_trade_price", "tick_size_change"):
                         token = str(event.get("asset_id") or "")
                         replay.note_ws(token, ts)
             elif kind == "gap":
                 tokens = record.get("token_ids")
                 if isinstance(tokens, list):
-                    replay.gap(index, [str(token) for token in tokens])
+                    replay.gap(index, [str(token) for token in tokens], recv_wall=wall_s)
             elif kind == "rest_book":
                 token = str(record.get("token_id") or "")
                 if not token:
@@ -147,10 +167,21 @@ def replay_dir(books: Path, replay: BookReplay) -> dict:
                     payload.get("bids"),
                     payload.get("asks"),
                     None if error is None else str(error),
+                    recv_wall=wall_s,
                 )
     report = replay.finish()
     report["files"] = [str(path) for path in files]
     report["dropped_duplicate_ws"] = dropped_dupes
+    report["duplicate_ws_rule"] = {
+        "match": "hash(raw) of the websocket payload text",
+        "hash": "Python hash(), salted per process, identical strings only",
+        "clock": "recv_monotonic_ns",
+        "window_ns": DUPLICATE_WINDOW_NS,
+        "window_inclusive": True,
+        "map_cap_before_prune": DUPLICATE_MAP_CAP,
+        "dropped": dropped_dupes,
+        "not_included": "extra bootstrap rest_book rows are ignored_extra_bootstrap, not this counter",
+    }
     report["ignored_extra_bootstrap"] = ignored_bootstrap
     report["price_change_multi_entry_tokens"] = multi_entry_tokens
     return report
@@ -168,10 +199,16 @@ def main() -> None:
         _load_gamma(args.gamma, replay)
     report = replay_dir(args.books, replay)
     mismatches = report.pop("first_quote_mismatches")
+    misses = report.get("aligned_level_misses")
+    histogram = report.get("resolved_quote_histogram")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
     mismatch_path = args.out.with_name(args.out.stem + "_mismatches.json")
     mismatch_path.write_text(json.dumps(mismatches, indent=2), encoding="utf-8")
+    if misses is not None:
+        miss_path = args.out.with_name(args.out.stem + "_aligned_misses.json")
+        miss_path.write_text(json.dumps(misses, indent=2), encoding="utf-8")
+
     def brief(name: str) -> str:
         block = report[name]
         rate = block["rate"]
@@ -188,6 +225,10 @@ def main() -> None:
         f"crossed_after_apply={report['crossed_after_apply']} tokens={len(report['crossed_tokens'])} "
         f"multi_entry={report['price_change_multi_entry_tokens']} dupes={report['dropped_duplicate_ws']}"
     )
+    if histogram:
+        print("resolved_quote_histogram")
+        print(json.dumps(histogram, indent=2, sort_keys=True))
+    print(f"aligned_level_misses={len(misses or [])} levels={report.get('aligned_level_miss_levels')}")
     print(f"wrote {args.out} and {mismatch_path}")
 
 
