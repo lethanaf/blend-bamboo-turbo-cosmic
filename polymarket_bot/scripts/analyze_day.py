@@ -374,14 +374,27 @@ def build_report(data_dir: Path) -> str:
     by_event = report.get("quote_by_event") if isinstance(report.get("quote_by_event"), dict) else {}
     lines.append(_rate_line("quote_price_change", by_event.get("price_change")))
     lines.append(_rate_line("quote_best_bid_ask", by_event.get("best_bid_ask")))
+    after = report.get("quote_best_bid_ask_after_same_ms")
+    lines.append(_rate_line("quote_best_bid_ask_after_same_ms", after))
     tie = report.get("quote_tie") if isinstance(report.get("quote_tie"), dict) else {}
     lines.append(_tie_line("all", tie.get("all")))
-    lines.append(_tie_line("resolved", tie.get("resolved")))
+    lines.append(_tie_line("closed_or_resolved", tie.get("resolved")))
     lines.append(_tie_line("open", tie.get("open")))
     tie_by_event = tie.get("by_event") if isinstance(tie.get("by_event"), dict) else {}
     lines.append(_tie_line("price_change", tie_by_event.get("price_change")))
     lines.append(_tie_line("best_bid_ask", tie_by_event.get("best_bid_ask")))
+    after_ties = after.get("ties") if isinstance(after, dict) else None
+    lines.append(_tie_line("best_bid_ask after same-ms", after_ties))
     lines.append(_dominate_line(tie))
+    lines.append(
+        "- best_bid_ask is scored twice: tape order when the event is seen, and after every "
+        "book mutation with that server timestamp has been applied. A different server timestamp "
+        "is not part of that group. price_change quotes stay tape order."
+    )
+    lines.append(
+        "- closed_or_resolved is the Gamma label for closed, or umaResolutionStatus resolved. "
+        "The file still stores gamma_status \"resolved\"."
+    )
     per = tie.get("per_1000_ws") if isinstance(tie.get("per_1000_ws"), dict) else {}
     for name in ("esports_in_play", "sports_in_play", "in_play", "other"):
         block = per.get(name) or {}

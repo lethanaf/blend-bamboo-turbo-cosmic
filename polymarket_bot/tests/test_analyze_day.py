@@ -137,6 +137,9 @@ def test_report_includes_windows_blocked_reasons_and_complete_sets(tmp_path: Pat
     assert "level_aligned" in report
     assert "ties_dominate: n/a" in report
     assert "ties_dominate: False" not in report
+    assert "- closed_or_resolved quote mismatches 0:" in report
+    assert "- resolved quote mismatches" not in report
+    assert "quote_best_bid_ask_after_same_ms: checked 0 mismatch 0 rate n/a" in report
     assert "- all quote mismatches 0:" in report
     assert "quote_price_change:" in report
     assert "quote_best_bid_ask:" in report

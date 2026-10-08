@@ -452,6 +452,34 @@ def quote_verdict(bids: Side, asks: Side, best_bid: str | None, best_ask: str | 
     }
 
 
+def _apply_book_mut(bids: Side, asks: Side, anchored: bool, mut: tuple) -> tuple[Side, Side, bool]:
+    """Apply one stored mutation. `px` updates the side objects in place."""
+    kind = mut[0]
+    if kind == "gap":
+        return Side(high=True), Side(high=False), False
+    if kind == "px":
+        if anchored:
+            side, price, size = mut[3], mut[4], mut[5]
+            if side == "BUY":
+                bids.apply(price, size)
+            elif side == "SELL":
+                asks.apply(price, size)
+        return bids, asks, anchored
+    return _load(mut[3], high=True), _load(mut[4], high=False), True
+
+
+def _bba_mismatch(
+    bids: Side, asks: Side, anchored: bool, best_bid: str | None, best_ask: str | None
+) -> bool | None:
+    """None when this quote is not a check. True when the touch disagrees."""
+    if not anchored:
+        return None
+    view = quote_verdict(bids, asks, best_bid, best_ask)
+    if view["verdict"] == "skip":
+        return None
+    return view["verdict"] == "mismatch"
+
+
 def levels_diff(local: Side, remote: tuple[tuple[str, str], ...]) -> dict[str, int]:
     got = {price: size for price, (size, _price_str, _size_str) in local.levels.items() if size != 0}
     want: dict[Decimal, Decimal] = {}
@@ -615,6 +643,7 @@ class BookReplay:
         self.quote_rows: list[tuple] = []
         self.resolved_quote_walls: list[tuple[str, str]] = []
         self.quote_mismatches: list[tuple[str, int | None, str, str]] = []
+        self.bba_events: list[tuple[str, int | None, str | None, str | None, bool, bool]] = []
         self.gamma: dict[str, str] = {}
         self.questions: dict[str, str] = {}
         self.market_class: dict[str, str] = {}
@@ -904,6 +933,7 @@ class BookReplay:
             "quote_by_event": {
                 name: self._event_quote_rate(name) for name in ("price_change", "best_bid_ask")
             },
+            "quote_best_bid_ask_after_same_ms": self._best_bid_ask_after_same_ms(),
             "crossed_after_apply": self.crossed,
             "crossed_tokens": sorted(self.crossed_tokens),
             "crossed_at_snapshot": dict(self.crossed_at_snapshot),
@@ -1062,7 +1092,9 @@ class BookReplay:
             "definition": (
                 "tie = another WS event for the same token with the same server timestamp, "
                 "earlier or later on the tape. not_tie is everything else, including a missing timestamp. "
-                "all counts every mismatch. resolved and open are the same count split by a Gamma label. "
+                "all counts every mismatch. resolved (report label closed_or_resolved: "
+                "Gamma closed, or umaResolutionStatus resolved) and open are the same count "
+                "split by a Gamma label. "
                 "by_event splits the mismatch, not the checked total, into price_change and best_bid_ask."
             ),
             "all": everyone,
@@ -1086,6 +1118,104 @@ class BookReplay:
             },
         }
 
+    def _best_bid_ask_after_same_ms(self) -> dict:
+        """Score best_bid_ask again after the same-server-ms book group.
+
+        Tape order scores the quote when the event is seen. This score uses
+        the book from just before the first mutation with that server
+        timestamp, then applies every mutation with that timestamp in tape
+        order. A different timestamp is not part of the group. A timestamp
+        with no book mutation keeps the tape-order score. price_change
+        quotes are not rescored.
+        """
+        by_token: dict[str, list[tuple]] = defaultdict(list)
+        needed: dict[str, set[int]] = defaultdict(set)
+        for token, ts, bid, ask, tape_checked, tape_mismatch in self.bba_events:
+            by_token[token].append((ts, bid, ask, tape_checked, tape_mismatch))
+            if isinstance(ts, int):
+                needed[token].add(ts)
+        checked = 0
+        mismatched = 0
+        rows: list[tuple[str, int | None]] = []
+        for token, events in by_token.items():
+            books = self._same_ms_group_books(token, needed.get(token, set()))
+            for ts, bid, ask, tape_checked, tape_mismatch in events:
+                if isinstance(ts, int) and ts in books:
+                    bids, asks, anchored = books[ts]
+                    result = _bba_mismatch(bids, asks, anchored, bid, ask)
+                else:
+                    result = tape_mismatch if tape_checked else None
+                if result is None:
+                    continue
+                checked += 1
+                if result:
+                    mismatched += 1
+                    rows.append((token, ts))
+        return {
+            "checked": checked,
+            "mismatch": mismatched,
+            "rate": None if checked == 0 else mismatched / checked,
+            "ties": self._pack_tie_rows(rows),
+            "definition": (
+                "best_bid_ask scored after every book mutation with that server timestamp "
+                "has been applied, in tape order, on the book from before the first of those "
+                "mutations. A different server timestamp is not part of the group. "
+                "A timestamp with no book mutation keeps the tape-order score. "
+                "price_change quotes stay tape order only."
+            ),
+        }
+
+    def _same_ms_group_books(self, token: str, needed: set[int]) -> dict[int, tuple[Side, Side, bool]]:
+        if not needed:
+            return {}
+        muts = self.muts.get(token) or []
+        positions: dict[int, list[int]] = defaultdict(list)
+        for index, mut in enumerate(muts):
+            if mut[0] == "gap":
+                continue
+            ts = mut[2]
+            if isinstance(ts, int) and ts in needed:
+                positions[ts].append(index)
+        if not positions:
+            return {}
+        live_bids = Side(high=True)
+        live_asks = Side(high=False)
+        anchored = False
+        open_groups: dict[int, list] = {}
+        books: dict[int, tuple[Side, Side, bool]] = {}
+        for index, mut in enumerate(muts):
+            kind = mut[0]
+            ts = None if kind == "gap" else mut[2]
+            if isinstance(ts, int) and ts in positions and index == positions[ts][0]:
+                open_groups[ts] = [live_bids.copy(), live_asks.copy(), anchored]
+            live_bids, live_asks, anchored = _apply_book_mut(live_bids, live_asks, anchored, mut)
+            if not (isinstance(ts, int) and ts in open_groups):
+                continue
+            group = open_groups[ts]
+            group[0], group[1], group[2] = _apply_book_mut(group[0], group[1], group[2], mut)
+            if index == positions[ts][-1]:
+                books[ts] = (group[0], group[1], group[2])
+                del open_groups[ts]
+        return books
+
+    def _pack_tie_rows(self, rows: list[tuple[str, int | None]]) -> dict:
+        tie = 0
+        no_ts = 0
+        for token, ts in rows:
+            if ts is None:
+                no_ts += 1
+                continue
+            if self.ws_count[token][ts] >= 2:
+                tie += 1
+        total = len(rows)
+        return {
+            "mismatches": total,
+            "tie": tie,
+            "not_tie": total - tie,
+            "no_server_ts": no_ts,
+            "tie_fraction": None if total == 0 else tie / total,
+        }
+
     def _score_quote(
         self,
         index: int,
@@ -1099,14 +1229,20 @@ class BookReplay:
     ) -> None:
         if token not in self.anchored:
             self.quote_checked_unanchored += 1
+            if source == "best_bid_ask":
+                self.bba_events.append((token, ts, best_bid, best_ask, False, False))
             return
         bids, asks = self._sides(token)
         view = quote_verdict(bids, asks, best_bid, best_ask)
         if view["verdict"] == "skip":
+            if source == "best_bid_ask":
+                self.bba_events.append((token, ts, best_bid, best_ask, False, False))
             return
         book_status = self._book_status(token, index)
         gamma_status = self.gamma.get(token, "unknown")
         mismatch = view["verdict"] == "mismatch"
+        if source == "best_bid_ask":
+            self.bba_events.append((token, ts, best_bid, best_ask, True, mismatch))
         self.quote.add(token, book_status, gamma_status, mismatch)
         self.quote_event_checked[source] += 1
         self.quote_event_mismatch[source] += int(mismatch)

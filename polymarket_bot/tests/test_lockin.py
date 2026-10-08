@@ -140,12 +140,96 @@ def test_quote_checks_split_by_price_change_and_best_bid_ask() -> None:
     assert by["price_change"] == {"checked": 2, "mismatch": 2, "rate": 1.0}
     assert by["best_bid_ask"]["checked"] == 2
     assert by["best_bid_ask"]["mismatch"] == 1
+    after = report["quote_best_bid_ask_after_same_ms"]
+    # Neither best_bid_ask shares a server timestamp with a book mutation.
+    assert after["checked"] == 2
+    assert after["mismatch"] == 1
+    assert report["quote_tape_order"]["checked"] == 4
     tie = report["quote_tie"]["by_event"]
     assert tie["price_change"]["mismatches"] == 2
     assert tie["price_change"]["tie"] == 2
     assert tie["best_bid_ask"]["mismatches"] == 1
     assert tie["best_bid_ask"]["tie"] == 0
     assert report["quote_tie"]["ties_dominate"] is True
+
+
+def _anchored(replay: BookReplay, token: str, ts: int, bid: str, ask: str, index: int, wall: str) -> None:
+    replay.replace(
+        index,
+        token,
+        ts,
+        [{"price": bid, "size": "5"}],
+        [{"price": ask, "size": "5"}],
+        kind="book",
+        recv_wall=wall,
+    )
+
+
+def test_best_bid_ask_after_same_ms_group_is_not_the_tape_order_book() -> None:
+    replay = BookReplay()
+    _anchored(replay, "t", 1000, "0.40", "0.60", 1, "2026-10-03T14:00:00+00:00")
+    # Quote lands before the same-timestamp delete and new touch.
+    replay.best_bid_ask(2, "t", 2000, "0.40", "0.55", recv_wall="2026-10-03T14:00:01+00:00")
+    replay.price_change(
+        3, "t", 2000, "SELL", "0.60", "0", None, None, recv_wall="2026-10-03T14:00:01.100000+00:00"
+    )
+    replay.price_change(
+        4, "t", 2000, "SELL", "0.55", "10", None, None, recv_wall="2026-10-03T14:00:01.200000+00:00"
+    )
+    report = replay.finish()
+    assert report["quote_by_event"]["best_bid_ask"] == {"checked": 1, "mismatch": 1, "rate": 1.0}
+    assert report["quote_tape_order"]["checked"] == 1
+    assert report["quote_tape_order"]["mismatch"] == 1
+    after = report["quote_best_bid_ask_after_same_ms"]
+    assert after["checked"] == 1
+    assert after["mismatch"] == 0
+    assert after["ties"]["mismatches"] == 0
+
+
+def test_after_same_ms_ignores_a_later_timestamp_that_arrives_during_the_group() -> None:
+    replay = BookReplay()
+    _anchored(replay, "t", 1000, "0.40", "0.60", 1, "2026-10-03T14:00:00+00:00")
+    replay.best_bid_ask(2, "t", 2000, "0.40", "0.55", recv_wall="2026-10-03T14:00:01+00:00")
+    # Opens the ts=2000 group. The book before it is still ask 0.60.
+    replay.price_change(
+        3, "t", 2000, "SELL", "0.55", "10", None, None, recv_wall="2026-10-03T14:00:01.100000+00:00"
+    )
+    # Different server time, inside the group on the tape. Not applied to that book.
+    replay.price_change(
+        4, "t", 3000, "SELL", "0.40", "5", None, None, recv_wall="2026-10-03T14:00:01.200000+00:00"
+    )
+    replay.price_change(
+        5, "t", 2000, "SELL", "0.70", "1", None, None, recv_wall="2026-10-03T14:00:01.300000+00:00"
+    )
+    report = replay.finish()
+    assert report["quote_by_event"]["best_bid_ask"]["mismatch"] == 1
+    after = report["quote_best_bid_ask_after_same_ms"]
+    assert after["checked"] == 1
+    assert after["mismatch"] == 0
+
+
+def test_same_ms_book_after_the_quote_is_the_after_group_touch() -> None:
+    replay = BookReplay()
+    _anchored(replay, "t", 1000, "0.40", "0.60", 1, "2026-10-03T14:00:00+00:00")
+    replay.best_bid_ask(2, "t", 2000, "0.42", "0.55", recv_wall="2026-10-03T14:00:01+00:00")
+    replay.replace(
+        3,
+        "t",
+        2000,
+        [{"price": "0.42", "size": "8"}],
+        [{"price": "0.55", "size": "8"}],
+        kind="book",
+        recv_wall="2026-10-03T14:00:01.100000+00:00",
+    )
+    # A later timestamp moves the touch. The ts=2000 quote does not use it.
+    replay.price_change(
+        4, "t", 3000, "SELL", "0.40", "5", None, None, recv_wall="2026-10-03T14:00:02+00:00"
+    )
+    report = replay.finish()
+    assert report["quote_tape_order"]["mismatch"] == 1
+    after = report["quote_best_bid_ask_after_same_ms"]
+    assert after["checked"] == 1
+    assert after["mismatch"] == 0
 
 
 def test_cursor_is_forward_only_and_same_ms_defer_drops_the_group() -> None:
