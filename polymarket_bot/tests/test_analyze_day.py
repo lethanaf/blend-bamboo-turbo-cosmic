@@ -135,7 +135,14 @@ def test_report_includes_windows_blocked_reasons_and_complete_sets(tmp_path: Pat
     report = analyze_day.build_report(tmp_path)
     assert "## Book replay" in report
     assert "level_aligned" in report
-    assert "ties_dominate" in report
+    assert "ties_dominate: n/a" in report
+    assert "ties_dominate: False" not in report
+    assert "- all quote mismatches 0:" in report
+    assert "quote_price_change:" in report
+    assert "quote_best_bid_ask:" in report
+    assert "- price_change quote mismatches" in report
+    assert "- best_bid_ask quote mismatches" in report
+    assert "--fetch-gamma" in report
     assert "## Binary buy" in report
     assert "| pair | 1.000 | 10 | 2.00 | yes | yes | yes |" in report
     assert "## Binary sell" in report
@@ -152,3 +159,41 @@ def test_report_includes_windows_blocked_reasons_and_complete_sets(tmp_path: Pat
     assert "queue position" in report
     assert "No orders. live_trading is false." in report
     assert analyze_day.main([str(tmp_path)]) == 0
+
+
+def test_fetch_gamma_flag_writes_before_the_report(tmp_path, monkeypatch, capsys) -> None:
+    market = _market("0xabc", "slug", "yes-tok", "no-tok")
+    store = Store(tmp_path / "catalog.sqlite", tmp_path / "books", Clock())
+    store.upsert_market(market)
+    store.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    store.close()
+
+    async def fake(data_dir: Path, **kwargs):
+        from pmbot.data.gamma_status import write_gamma_status
+
+        write_gamma_status(
+            Path(data_dir) / "gamma_status.json",
+            {"yes-tok": {"gamma_status": "open", "question": "Q", "outcome": "Yes", "slug": "s"}},
+        )
+        return {"yes-tok": {"gamma_status": "open"}}
+
+    monkeypatch.setattr(analyze_day, "fetch_and_write", fake)
+    assert analyze_day.main([str(tmp_path), "--fetch-gamma"]) == 0
+    saved = json.loads((tmp_path / "gamma_status.json").read_text(encoding="utf-8"))
+    assert saved["yes-tok"]["gamma_status"] == "open"
+    out = capsys.readouterr().out
+    assert "gamma file: `gamma_status.json`" in out
+    assert "ties_dominate: n/a" in out
+
+
+def test_fetch_gamma_does_not_run_without_a_catalog(tmp_path, monkeypatch) -> None:
+    called = False
+
+    async def fake(data_dir: Path, **kwargs):
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(analyze_day, "fetch_and_write", fake)
+    assert analyze_day.main([str(tmp_path), "--fetch-gamma"]) == 2
+    assert called is False

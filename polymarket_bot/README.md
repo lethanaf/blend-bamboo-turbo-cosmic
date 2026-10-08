@@ -362,3 +362,9 @@ A diversified refresh applies `exclude_ending_within_s` inside `discover_markets
 Every 10 minutes the process logs `progress messages= markets_live= ended= gaps= mb_written=`. `mb_written` is gzip bytes this process has flushed, divided by 1024². It is not the size of older files in the directory.
 
 `python scripts/analyze_day.py <data_dir>` replays `books/`, scores aligned levels and quote ties, scans binary buy and sell, and scans complete neg-risk sets from `neg_risk_events` (sum of YES asks, sum of YES bids, each leg's own feeSchedule, at 0/100/250/500 ms). It prints one markdown report and does not send orders. It runs on Windows and WSL. The recording was not started.
+
+## Gamma status file and quote event split
+
+`ties_dominate` counts every quote mismatch, labeled or not. It is `n/a` when the tape has no quote mismatch to classify, not `False`. `resolved` and `open` are that same count split by a Gamma label. The recorder does not write `gamma_status.json`. `python scripts/analyze_day.py <data_dir> --fetch-gamma` builds it for the catalog's condition ids: `GET /markets` with `closed=false`, then the same ids with `closed=true`, because the default list hides resolved markets. A token Gamma does not return stays out of the file.
+
+Quote checks are also split into `price_change` and `best_bid_ask`, with ties inside each. A `price_change` that carries neither a best bid nor a best ask is not a quote check. No recording was started.

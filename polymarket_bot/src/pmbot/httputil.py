@@ -24,7 +24,7 @@ def client(base_url: str, timeout_s: float) -> httpx.AsyncClient:
 async def get_text(
     http: httpx.AsyncClient,
     path: str,
-    params: dict | None = None,
+    params: dict | list | None = None,
     attempts: int = 3,
 ) -> httpx.Response:
     delay = 0.5

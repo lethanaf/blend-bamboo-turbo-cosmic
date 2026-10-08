@@ -497,7 +497,7 @@ def main() -> None:
     summary = {
         "caveat": caveat,
         "cursor_clock": "recv_wall",
-        "ties_dominate": bool(tie["ties_dominate"]),
+        "ties_dominate": tie.get("ties_dominate"),
         "quote_tie": tie,
         "recv_clock": clock,
         "token_recv_wall_backward": token_backward,

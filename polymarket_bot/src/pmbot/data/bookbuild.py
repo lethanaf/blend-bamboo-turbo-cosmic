@@ -614,7 +614,7 @@ class BookReplay:
         self.snapshots: list[dict] = []
         self.quote_rows: list[tuple] = []
         self.resolved_quote_walls: list[tuple[str, str]] = []
-        self.quote_mismatches: list[tuple[str, int | None, str]] = []
+        self.quote_mismatches: list[tuple[str, int | None, str, str]] = []
         self.gamma: dict[str, str] = {}
         self.questions: dict[str, str] = {}
         self.market_class: dict[str, str] = {}
@@ -626,6 +626,8 @@ class BookReplay:
         self.crossed_at_snapshot = {"aligned": 0, "unaligned": 0}
         self.quote = _Rate()
         self.quote_quiet = _Rate()
+        self.quote_event_checked: Counter[str] = Counter()
+        self.quote_event_mismatch: Counter[str] = Counter()
         self.level_aligned = _Rate()
         self.level_unaligned = _Rate()
         self.level_aligned_quiet = _Rate()
@@ -753,7 +755,7 @@ class BookReplay:
         )
         if best_bid is None and best_ask is None:
             return
-        self._score_quote(index, token, ts, best_bid, best_ask, recv_wall=recv_wall)
+        self._score_quote(index, token, ts, best_bid, best_ask, recv_wall=recv_wall, source="price_change")
 
     def best_bid_ask(
         self,
@@ -769,7 +771,7 @@ class BookReplay:
         self.precede[token].append(
             {"kind": "best_bid_ask", "index": index, "ts": ts, "best_bid": best_bid, "best_ask": best_ask}
         )
-        self._score_quote(index, token, ts, best_bid, best_ask, recv_wall=recv_wall)
+        self._score_quote(index, token, ts, best_bid, best_ask, recv_wall=recv_wall, source="best_bid_ask")
 
     def rest(
         self,
@@ -899,6 +901,9 @@ class BookReplay:
             "top_unaligned_quiet": self.top_unaligned_quiet.as_dict(),
             "quote_tape_order": self.quote.as_dict(),
             "quote_tape_order_quiet": self.quote_quiet.as_dict(),
+            "quote_by_event": {
+                name: self._event_quote_rate(name) for name in ("price_change", "best_bid_ask")
+            },
             "crossed_after_apply": self.crossed,
             "crossed_tokens": sorted(self.crossed_tokens),
             "crossed_at_snapshot": dict(self.crossed_at_snapshot),
@@ -989,39 +994,56 @@ class BookReplay:
             ),
         }
 
+    def _event_quote_rate(self, source: str) -> dict:
+        checked = self.quote_event_checked[source]
+        mismatch = self.quote_event_mismatch[source]
+        return {
+            "checked": checked,
+            "mismatch": mismatch,
+            "rate": None if checked == 0 else mismatch / checked,
+        }
+
     def _quote_tie_report(self) -> dict:
         """Same-server-timestamp ties, either tape order.
 
         A quote mismatch is a tie when ws_count for that token and server
         timestamp is at least 2. The mismatch's own event is one of those.
-        The other event may sit earlier or later on the tape.
+        The other event may sit earlier or later on the tape. Labels from
+        Gamma are not required. `ties_dominate` is null when no mismatch
+        was classified.
         """
 
-        def pack(gamma: str) -> dict:
-            rows = [row for row in self.quote_mismatches if row[2] == gamma]
+        def pack(rows: list[tuple]) -> dict:
             tie = 0
             no_ts = 0
-            for token, ts, _gamma in rows:
+            for token, ts, *_rest in rows:
                 if ts is None:
                     no_ts += 1
                     continue
                 if self.ws_count[token][ts] >= 2:
                     tie += 1
             total = len(rows)
-            not_tie = total - tie
             return {
                 "mismatches": total,
                 "tie": tie,
-                "not_tie": not_tie,
+                "not_tie": total - tie,
                 "no_server_ts": no_ts,
                 "tie_fraction": None if total == 0 else tie / total,
             }
+
+        def select(*, gamma: str | None = None, source: str | None = None) -> list[tuple]:
+            rows = self.quote_mismatches
+            if gamma is not None:
+                rows = [row for row in rows if row[2] == gamma]
+            if source is not None:
+                rows = [row for row in rows if len(row) > 3 and row[3] == source]
+            return rows
 
         ws_by: Counter[str] = Counter()
         for token, stamps in self.ws_ts.items():
             ws_by[self.market_class.get(token, "unknown")] += len(stamps)
         mis_by: Counter[str] = Counter()
-        for token, _ts, _gamma in self.quote_mismatches:
+        for token, _ts, _gamma, *_rest in self.quote_mismatches:
             mis_by[self.market_class.get(token, "unknown")] += 1
 
         def rate(bucket: str) -> dict:
@@ -1035,18 +1057,22 @@ class BookReplay:
 
         in_play_events = ws_by["esports_in_play"] + ws_by["sports_in_play"]
         in_play_mis = mis_by["esports_in_play"] + mis_by["sports_in_play"]
-        resolved = pack("resolved")
-        opened = pack("open")
+        everyone = pack(self.quote_mismatches)
         return {
             "definition": (
                 "tie = another WS event for the same token with the same server timestamp, "
-                "earlier or later on the tape. not_tie is everything else, including a missing timestamp."
+                "earlier or later on the tape. not_tie is everything else, including a missing timestamp. "
+                "all counts every mismatch. resolved and open are the same count split by a Gamma label. "
+                "by_event splits the mismatch, not the checked total, into price_change and best_bid_ask."
             ),
-            "resolved": resolved,
-            "open": opened,
-            "ties_dominate": bool(
-                resolved["mismatches"] and resolved["tie"] > resolved["not_tie"]
-            ),
+            "all": everyone,
+            "resolved": pack(select(gamma="resolved")),
+            "open": pack(select(gamma="open")),
+            "by_event": {
+                "price_change": pack(select(source="price_change")),
+                "best_bid_ask": pack(select(source="best_bid_ask")),
+            },
+            "ties_dominate": None if everyone["mismatches"] == 0 else everyone["tie"] > everyone["not_tie"],
             "per_1000_ws": {
                 "esports_in_play": rate("esports_in_play"),
                 "sports_in_play": rate("sports_in_play"),
@@ -1069,6 +1095,7 @@ class BookReplay:
         best_ask: str | None,
         *,
         recv_wall: str | None,
+        source: str,
     ) -> None:
         if token not in self.anchored:
             self.quote_checked_unanchored += 1
@@ -1081,10 +1108,12 @@ class BookReplay:
         gamma_status = self.gamma.get(token, "unknown")
         mismatch = view["verdict"] == "mismatch"
         self.quote.add(token, book_status, gamma_status, mismatch)
+        self.quote_event_checked[source] += 1
+        self.quote_event_mismatch[source] += int(mismatch)
         if self.keep_quote_rows:
             self.quote_rows.append((token, ts, book_status, gamma_status, mismatch))
         if mismatch:
-            self.quote_mismatches.append((token, ts, gamma_status))
+            self.quote_mismatches.append((token, ts, gamma_status, source))
         if mismatch and gamma_status == "resolved":
             self.resolved_quote_walls.append((token, recv_wall or ""))
         if mismatch and len(self.mismatches) < self.mismatch_limit:

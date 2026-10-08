@@ -74,6 +74,80 @@ def test_same_server_timestamp_is_a_tie_in_either_tape_order() -> None:
     assert per["other"]["ws_events"] == 2
 
 
+def test_unlabeled_ties_count_and_an_empty_replay_is_not_a_finding() -> None:
+    empty = BookReplay().finish()
+    assert empty["quote_tie"]["ties_dominate"] is None
+    assert empty["quote_tie"]["all"]["mismatches"] == 0
+    assert empty["quote_tie"]["resolved"]["mismatches"] == 0
+
+    replay = BookReplay()
+    replay.replace(
+        1,
+        "t",
+        1000,
+        [{"price": "0.40", "size": "5"}],
+        [{"price": "0.60", "size": "5"}],
+        kind="book",
+        recv_wall="2026-10-03T14:00:00+00:00",
+    )
+    replay.best_bid_ask(2, "t", 1100, "0.40", "0.50", recv_wall="2026-10-03T14:00:01+00:00")
+    replay.best_bid_ask(3, "t", 1100, "0.40", "0.50", recv_wall="2026-10-03T14:00:01.100000+00:00")
+    report = replay.finish()
+    tie = report["quote_tie"]
+    assert tie["resolved"]["mismatches"] == 0
+    assert tie["open"]["mismatches"] == 0
+    assert tie["all"] == {
+        "mismatches": 2,
+        "tie": 2,
+        "not_tie": 0,
+        "no_server_ts": 0,
+        "tie_fraction": 1.0,
+    }
+    assert tie["ties_dominate"] is True
+    assert tie["by_event"]["best_bid_ask"]["mismatches"] == 2
+    assert tie["by_event"]["price_change"]["mismatches"] == 0
+
+
+def test_quote_checks_split_by_price_change_and_best_bid_ask() -> None:
+    replay = BookReplay()
+    replay.replace(
+        1,
+        "t",
+        1000,
+        [{"price": "0.40", "size": "5"}],
+        [{"price": "0.60", "size": "5"}],
+        kind="book",
+        recv_wall="2026-10-03T14:00:00+00:00",
+    )
+    # Quoted ask 0.50 is not the local 0.60. The 0.70 level does not move the touch.
+    replay.price_change(
+        2, "t", 1100, "SELL", "0.70", "3", "0.40", "0.50", recv_wall="2026-10-03T14:00:01+00:00"
+    )
+    replay.price_change(
+        3, "t", 1100, "SELL", "0.70", "4", "0.40", "0.50", recv_wall="2026-10-03T14:00:01.100000+00:00"
+    )
+    replay.best_bid_ask(4, "t", 2000, "0.40", "0.55", recv_wall="2026-10-03T14:00:02+00:00")
+    replay.best_bid_ask(5, "t", 3000, "0.40", "0.60", recv_wall="2026-10-03T14:00:03+00:00")
+    # No quoted touch. Not a quote check.
+    replay.price_change(
+        6, "t", 4000, "SELL", "0.70", "0", None, None, recv_wall="2026-10-03T14:00:04+00:00"
+    )
+    report = replay.finish()
+    by = report["quote_by_event"]
+    quote = report["quote_tape_order"]
+    assert by["price_change"]["checked"] + by["best_bid_ask"]["checked"] == quote["checked"]
+    assert by["price_change"]["mismatch"] + by["best_bid_ask"]["mismatch"] == quote["mismatch"]
+    assert by["price_change"] == {"checked": 2, "mismatch": 2, "rate": 1.0}
+    assert by["best_bid_ask"]["checked"] == 2
+    assert by["best_bid_ask"]["mismatch"] == 1
+    tie = report["quote_tie"]["by_event"]
+    assert tie["price_change"]["mismatches"] == 2
+    assert tie["price_change"]["tie"] == 2
+    assert tie["best_bid_ask"]["mismatches"] == 1
+    assert tie["best_bid_ask"]["tie"] == 0
+    assert report["quote_tie"]["ties_dominate"] is True
+
+
 def test_cursor_is_forward_only_and_same_ms_defer_drops_the_group() -> None:
     replay = BookReplay()
     replay.replace(

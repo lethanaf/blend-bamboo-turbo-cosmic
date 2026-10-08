@@ -3,16 +3,21 @@
 
 Usage:
     python scripts/analyze_day.py data/day
+    python scripts/analyze_day.py data/day --fetch-gamma
 
 `data_dir` is the recorder directory: `catalog.sqlite` plus `books/**/*.jsonl.gz`.
 The report is aligned level scores, quote ties, binary buy and sell lock-ins,
 and complete neg-risk sets from the catalog sibling lists (sum of YES asks,
 sum of YES bids, after each leg's feeSchedule, at 0/100/250/500 ms).
+
+`--fetch-gamma` writes `gamma_status.json` from Gamma for the catalog's
+condition ids before the replay. The recorder does not write that file.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sqlite3
 import sys
@@ -25,6 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from pmbot.data.bookbuild import BookReplay, iso_to_ns  # noqa: E402
 from pmbot.data.fill import caveat_from_report  # noqa: E402
+from pmbot.data.gamma_status import fetch_and_write  # noqa: E402
 from pmbot.data.lockin import scan_binary_pair, scan_outcome_set  # noqa: E402
 from replay_book import _load_gamma, replay_dir  # noqa: E402
 from scan_lockin import UNMODELED  # noqa: E402
@@ -94,6 +100,16 @@ def _tie_line(label: str, block: object) -> str:
         f"- {label} quote mismatches {block.get('mismatches')}: "
         f"tie {block.get('tie')} not_tie {block.get('not_tie')} fraction {shown}"
     )
+
+
+def _dominate_line(tie: dict) -> str:
+    """n/a when nothing was classified. False is only a real comparison."""
+    dominate = tie.get("ties_dominate")
+    everyone = tie.get("all") if isinstance(tie.get("all"), dict) else {}
+    mismatches = everyone.get("mismatches")
+    if dominate is None or not mismatches:
+        return "- ties_dominate: n/a"
+    return f"- ties_dominate: {bool(dominate)}"
 
 
 def _group_blocked(blocked: dict[str, int]) -> list[tuple[str, int]]:
@@ -355,10 +371,17 @@ def build_report(data_dir: Path) -> str:
         _rate_line("quote_tape_order", report.get("quote_tape_order")),
         _rate_line("quote_tape_order_quiet", report.get("quote_tape_order_quiet")),
     ]
+    by_event = report.get("quote_by_event") if isinstance(report.get("quote_by_event"), dict) else {}
+    lines.append(_rate_line("quote_price_change", by_event.get("price_change")))
+    lines.append(_rate_line("quote_best_bid_ask", by_event.get("best_bid_ask")))
     tie = report.get("quote_tie") if isinstance(report.get("quote_tie"), dict) else {}
+    lines.append(_tie_line("all", tie.get("all")))
     lines.append(_tie_line("resolved", tie.get("resolved")))
     lines.append(_tie_line("open", tie.get("open")))
-    lines.append(f"- ties_dominate: {bool(tie.get('ties_dominate'))}")
+    tie_by_event = tie.get("by_event") if isinstance(tie.get("by_event"), dict) else {}
+    lines.append(_tie_line("price_change", tie_by_event.get("price_change")))
+    lines.append(_tie_line("best_bid_ask", tie_by_event.get("best_bid_ask")))
+    lines.append(_dominate_line(tie))
     per = tie.get("per_1000_ws") if isinstance(tie.get("per_1000_ws"), dict) else {}
     for name in ("esports_in_play", "sports_in_play", "in_play", "other"):
         block = per.get(name) or {}
@@ -373,7 +396,10 @@ def build_report(data_dir: Path) -> str:
     if gamma_path.is_file():
         lines.append(f"- gamma file: `{gamma_path.name}`")
     else:
-        lines.append("- gamma file: none (resolution is not labeled; the scans still run)")
+        lines.append(
+            "- gamma file: none (pass --fetch-gamma to build gamma_status.json from Gamma "
+            "for the catalog tokens; scans still run without labels)"
+        )
     lines.append("")
 
     binaries = [market for market in markets if len(market["tokens"]) == 2]
@@ -508,6 +534,11 @@ def build_report(data_dir: Path) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Replay a recording and print one markdown report. No orders.")
     parser.add_argument("data_dir", type=Path, help="Recorder directory (catalog.sqlite and books/)")
+    parser.add_argument(
+        "--fetch-gamma",
+        action="store_true",
+        help="Write data_dir/gamma_status.json from Gamma for the catalog condition ids, then report.",
+    )
     args = parser.parse_args(argv)
     data_dir = args.data_dir
     if not data_dir.is_dir():
@@ -517,6 +548,9 @@ def main(argv: list[str] | None = None) -> int:
     if not catalog.is_file():
         print(f"no catalog at {catalog}", file=sys.stderr)
         return 2
+    if args.fetch_gamma:
+        rows = asyncio.run(fetch_and_write(data_dir))
+        print(f"wrote {data_dir / 'gamma_status.json'} ({len(rows)} tokens)", file=sys.stderr)
     _emit(build_report(data_dir))
     return 0
 
